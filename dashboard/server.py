@@ -10,6 +10,17 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+
+# ─── CORS: allow frontend on any port ──────────────────────────────────
+@app.after_request
+def add_cors(response):
+    origin = request.headers.get("Origin", "")
+    if origin and ("localhost" in origin or "127.0.0.1" in origin or "ngrok-free.app" in origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return response
+
 HOME = Path.home()
 STATE_FILE = HOME / ".wq_workflow_v2.json"
 LOG_FILE = HOME / ".wq_workflow_v2.log"
