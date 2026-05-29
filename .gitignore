@@ -1,23 +1,9 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
 .env
-
-# WQ runtime state (auto-generated, machine-specific)
-*.json
+*.egg-info/
+dist/
+build/
+node_modules/
+.next/
 *.log
-
-# macOS
-.DS_Store
-
-# IDE
-.vscode/
-.idea/
-
-# Export tokens never committed
-*_token*
-*_secret*
-*_key*
-github_pat_*
-ghp_*

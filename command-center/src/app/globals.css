@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* Background colors */
+  --bg-primary: #08080e;
+  --bg-secondary: #0d0d18;
+  --bg-tertiary: #12121f;
+  --bg-elevated: #18182a;
+  --bg-hover: #1a1a2e;
+  --bg-active: #22223a;
+
+  /* Surface / card colors */
+  --surface: #0f0f1a;
+  --surface-border: #1e1e36;
+  --surface-hover: #191928;
+
+  /* Text colors */
+  --text-primary: #e8e8f0;
+  --text-secondary: #9898b8;
+  --text-tertiary: #686888;
+  --text-muted: #484860;
+  --text-inverse: #08080e;
+
+  /* Accent colors — cyber/quant green-blue */
+  --accent-primary: #00f5d4;
+  --accent-secondary: #00c8ff;
+  --accent-tertiary: #7b61ff;
+  --accent-warning: #f59e0b;
+  --accent-danger: #ef4444;
+  --accent-success: #22c55e;
+
+  /* Grid pattern color */
+  --grid-color: rgba(0, 245, 212, 0.04);
+
+  /* Scrollbar */
+  --scrollbar-thumb: #2a2a44;
+  --scrollbar-thumb-hover: #3a3a5a;
+  --scrollbar-track: transparent;
+  --scrollbar-width: 8px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.6);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.7);
+  --shadow-glow: 0 0 20px rgba(0, 245, 212, 0.1);
+
+  /* Borders */
+  --border-subtle: 1px solid #1e1e36;
+  --border-accent: 1px solid rgba(0, 245, 212, 0.2);
+
+  /* Fonts */
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+@theme inline {
+  --color-background: var(--bg-primary);
+  --color-foreground: var(--text-primary);
+  --color-surface: var(--surface);
+  --color-surface-border: var(--surface-border);
+  --color-accent: var(--accent-primary);
+  --color-muted: var(--text-muted);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+/* ─── Card component style ─── */
+.card {
+  background-color: var(--surface);
+  border: var(--border-subtle);
+  border-radius: 0.75rem;
+}
+
+/* ─── Base body ─── */
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  background-image:
+    linear-gradient(var(--grid-color) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: center center;
+}
+
+/* ─── Custom scrollbar ─── */
+* {
+  scrollbar-width: var(--scrollbar-width);
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar {
+  width: var(--scrollbar-width);
+  height: var(--scrollbar-width);
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ─── Selection ─── */
+::selection {
+  background: rgba(0, 245, 212, 0.2);
+  color: var(--text-primary);
+}
+
+/* ─── Utility: smooth scrolling ─── */
+html {
+  scroll-behavior: smooth;
+}
+
+/* ─── Dark mode media query fallback ─── */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-primary: #08080e;
+  }
+}
