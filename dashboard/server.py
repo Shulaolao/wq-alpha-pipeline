@@ -377,7 +377,7 @@ def index():
     })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8765))
+    port = int(os.environ.get("PORT", 8767))
     print(f"🚀 WQ Dashboard v2 starting on http://0.0.0.0:{port}")
     print(f"   State: {STATE_FILE}")
     print(f"   Batch: {BATCH_FILE}")
