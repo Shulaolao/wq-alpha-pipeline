@@ -1,16 +1,29 @@
 # WQ Alpha Pipeline
 
-> WorldQuant BRAIN 自动化 Alpha 因子挖掘流水线
+> WorldQuant BRAIN 自动化 Alpha 因子挖掘流水线 — 单进程全链路，`launchd` 守护
+
+**当前状态** 🔄 15/20 ACTIVE（2026-05-30）
+
+[![GitHub](https://img.shields.io/badge/GitHub-Shulaolao/wq--alpha--pipeline-181717?logo=github)](https://github.com/Shulaolao/wq-alpha-pipeline)
+
+---
 
 ## 架构
 
 ```
-wq_workflow_v2.py → launchd (后台守护) → 飞书通知
-     ├── 正交分析 (字段/结构/AST 三重去重)
-     ├── 候选生成 (乘法骨架 / 减法骨架自适应切换)
-     ├── 自适应 IS/SC 轮询 (卡0% 300s自动放弃)
-     └── 调参重试 (5变体 × 权重扫描)
+wq_workflow_v2.py → launchd (后台守护，崩溃自愈) → 飞书 Bot 推送
+     ├── 1. 正交分析 — 字段使用频率 + AST 结构去重
+     ├── 2. 候选生成 — 正交性评分驱动，乘法/减法骨架自适应
+     ├── 3. Quick SIM — P1Y 轻量过滤弱信号
+     ├── 4. Full IS  — 全量回测 + 自适应轮询 (15s→60s→120s)
+     ├── 5. 调参重试 — 5 变体 × 权重扫描
+     ├── 6. SC 提交  — 自适应轮询 (30s→120s)
+     └── 7. Loop    — 直到 20 ACTIVE
 ```
+
+**Dashboard 监控面板** (端口 8765) 实时读取状态文件。
+
+---
 
 ## 快速启动
 
@@ -22,69 +35,105 @@ python3 wq_workflow_v2.py
 
 # launchd 管理（生产）
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hermes.wq-workflow.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hermes.wq-dashboard.plist
 
-# Dashboard（监控面板）
-cd dashboard && python3 server.py  # 端口 8765
+# 停止
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.hermes.wq-workflow.plist
+
+# Dashboard
+open http://localhost:8765
 ```
+
+---
 
 ## 目录结构
 
 ```
 wq-alpha-pipeline/
-├── wq_workflow_v2.py          # 主工作流（单进程全链路）
+├── wq_workflow_v2.py               # 主工作流 (1343 行)
 ├── scripts/
-│   └── wq_pipeline.py         # 旧版分段流水线（已废弃）
+│   └── wq_pipeline.py              # 旧版三阶段流水线（已废弃）
 ├── config/
 │   ├── com.hermes.wq-workflow.plist   # 工作流 launchd 配置
 │   └── com.hermes.wq-dashboard.plist  # 面板 launchd 配置
 ├── dashboard/
-│   ├── server.py               # Flask 后端
-│   └── index.html              # 前端面板
+│   ├── server.py                    # Flask 后端 (171 行)
+│   └── index.html                   # 暗色主题前端面板 (611 行)
 ├── docs/
-│   ├── v2-workflow-architecture.md    # v2 工作流架构
-│   └── wq-valid-fields-audit.md       # WQ 字段验证审计
+│   ├── v2-workflow-architecture.md  # v2 工作流架构说明
+│   └── wq-valid-fields-audit.md     # WQ 字段验证审计
 ├── requirements.txt
 └── README.md
 ```
 
+---
+
 ## 核心特性
 
-### v3 升级 (2026-05-29)
-- **AST 结构树去重**：同骨架（`rank(A/B)*rank(C/D)+W*rank(M)`）在 ACTIVE 中 ≥2 个后自动切换减法型候选
-- **时频相容性过滤**：pv1（日频）与 fundamental（季频）禁止混合组 ratio pair → 消除 `S=None` 根因
-- **已验证字段对白名单**：优先使用历史 IS PASS 记录中的字段对
-- **认知框架 v3**：5 步思考闭环（Pre-Collision → Observe → Reflect → Critique → Execute）
+### 设计理念
 
-### 自适应轮询
-| 阶段 | 初始间隔 | 降频 | 超时 |
-|------|---------|------|------|
-| Quick SIM | 10s → 30s | 10min | 600s |
-| Full IS | 15s → 60s → 120s | 2min/10min | 3600s |
-| SC | 30s → 120s | 2min | 3600s |
+- **替代 cron**：旧版 6 个定时任务 → 1 个后台进程。IS/SC 回测时长 3-40 分钟不等，固定时间切片要么空转要么漏结果。单进程内部自适应轮询，IS 完成立即进 SC。
+- **launchd 守护**：macOS 原生服务管理，`KeepAlive` + `ThrottleInterval` 30s 自动恢复，等同于 Linux systemd。
+- **自适应轮询**：IS/SC 提交后不等固定时间，从短间隔开始逐级降频（15s → 30s → 60s → 120s），卡 0% 超时自动放弃。
 
-### 飞书推送
-- IS/SC 通过、新 ACTIVE、调参耗尽时自动推送
+### 正交分析 + AST 去重
+
+| 去重维度 | 策略 |
+|---------|------|
+| 字段使用频率 | 优先用 0/1 次使用字段构造 ratio 对 |
+| 结构骨架 | 同骨架（`rank(A/B)*rank(C/D)+W*rank(M)`）超过 2 个自动切减法型 |
+| 时频相容 | `pv1`（日频）与 `fundamental`（季频）禁止直接混合 ratio |
+| 已验证白名单 | 优先用历史 IS PASS 字段对 |
+
+### 已验证 WQ 字段（17 个）
+
+```
+fundamental6: revenue, enterprise_value, debt, equity, operating_income,
+              ebitda, cap, cash, sales
+pv1:          close, volume, adv20, returns, vwap, open, high, low
+```
+
+### 飞书 Bot 推送
+
+- 事件：IS/SC 通过、新 ACTIVE、调参耗尽、流水线错误
 - 零 LLM Token 成本（纯 Bot API）
 - 30s 同事件去重
 
-## WQ 可用字段
+### 认知框架
 
-共 **17 个** 已验证字段：
+5 步思考闭环（Pre-Collision → Observe → Reflect → Critique → Execute）
+严格 JSON Schema 输出，见 `refs/cognitive-framework-v3.md`。
 
-| 数据源 | 字段 |
-|--------|------|
-| **fundamental6** | `revenue`, `enterprise_value`, `debt`, `equity`, `operating_income`, `ebitda`, `cap`, `cash`, `sales` |
-| **pv1** | `close`, `volume`, `adv20`, `returns`, `vwap`, `open`, `high`, `low` |
+---
+
+## 状态文件
+
+```json
+~/.wq_workflow_v2.json    # 实时流水线状态（ACTIVE 列表、阶段、候选、统计）
+~/.wq_workflow_v2.log     # 结构化日志（时间戳|级别|消息）
+~/.wq_workflow_v2_stdout.log   # launchd stdout
+~/.wq_workflow_v2_stderr.log   # launchd stderr
+```
+
+---
 
 ## 配置
 
-通过环境变量配置：
-
 ```bash
-export EMAIL="your@email.com"
-export PASS="your_password"
+export WQ_EMAIL="shufengln@gmail.com"
+export WQ_PASS="your_password"
 export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 ```
 
-或直接编辑脚本中的 `API`, `EMAIL`, `PASS` 常量。
+或编辑 `wq_workflow_v2.py` 头部常量。字段在 `ALL_WQ_FIELDS` 中维护，新增需同步更新。
+
+---
+
+## 项目信息
+
+- **仓库**: https://github.com/Shulaolao/wq-alpha-pipeline
+- **运行时**: macOS ARM64, Python 3.13 (Anaconda)
+- **依赖**: requests, urllib3, flask
+- **工作流**: launchd → `com.hermes.wq-workflow`
+- **监控**: Dashboard `:8765` + 飞书推送 + cron 晨报 `06:00 CST`
