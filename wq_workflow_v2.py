@@ -1167,40 +1167,105 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         seen_exprs.add(c["expr"])
         deduped.append(c)
     
-# ── Tiered selection: MULT is primary — proven working in TOP3000 ──
-    # Non-MULT skeletons (subtraction, IND_NEUT, DIRECT_RANK, add, etc.)
-    # systematically produce S=None in TOP3000. Only use them if MULT pool
-    # doesn't have enough candidates to fill the batch.
-    # Within MULT, pick one per template (field combo) for diversity.
-    mult_pool = [c for c in deduped if c.get("skeleton") == SKELETON_MULT]
-    other_pool = [c for c in deduped if c.get("skeleton") != SKELETON_MULT]
+# ── Skeleton rotation: cycle through skeletons to prevent MULT lock-in ──
+    # Field pool is saturated (15 ACTIVE). MULT alone can't break through.
+    # Rotate through skeleton tiers each batch:
+    #   Phase 0: MULT (with exhaustion detection)
+    #   Phase 1: DIRECT_RANK + PURE_ADD (no ratio pair, lowest S=None risk)
+    #   Phase 2: THREE_TERM + IND_NEUT + SUB + PURE_MULT + RATIO_LAG
+    # When stuck_batches increments (all S=None), rotation advances.
+    import re
     
     def _sort_key(c):
         return -c["orthogonality_score"]
     
-    mult_pool.sort(key=_sort_key)
-    other_pool.sort(key=_sort_key)
+    rotation_phase = stuck_batches % 3
+    # Aggressive trigger: if failed_expressions > 20, always rotate
+    # (field pool is clearly saturated, MULT has exhausted its space)
+    if failed_exprs and len(failed_exprs) > 20 and rotation_phase == 0:
+        rotation_phase = 1
+        log(f"  ⚡ {len(failed_exprs)} failed exprs → forcing rotation Phase 1")
     
-    # Select from MULT: group by template (r1+r2+mom), pick best weight per template
-    import re
-    seen_templates = set()
-    mult_selected = []
-    for c in mult_pool:
-        if len(mult_selected) >= n:
-            break
-        # Template key: strip weight to get the base field combination
-        tkey = re.sub(r'\+[0-9.]+\*\w+\(.*\)$', '', c["expr"])
-        if tkey in seen_templates:
-            continue
-        seen_templates.add(tkey)
-        mult_selected.append(c)
+    # Split candidates by skeleton type for targeted selection
+    skeleton_groups = {}
+    for c in deduped:
+        sk = c.get("skeleton", "unknown")
+        skeleton_groups.setdefault(sk, []).append(c)
     
-    result = mult_selected[:n]
-    if len(result) < n:
-        for c in other_pool:
+    def sorted_group(sk):
+        """Get a skeleton group sorted by orthogonality score."""
+        g = skeleton_groups.get(sk, [])
+        g.sort(key=_sort_key)
+        return g
+    
+    # ── MULT exhaustion detection ──
+    # Check if failed_expressions already contains all 4 weight variants
+    # for ≥ 50% of MULT templates → skip MULT entirely
+    mult_pool = sorted_group(SKELETON_MULT)
+    mult_exhausted = False
+    if failed_exprs and mult_pool:
+        MULT_WEIGHTS = [0.3, 0.5, 0.7, 0.9]
+        seen_templates = set()
+        exhausted_count = 0
+        total_templates = 0
+        for c in mult_pool:
+            tkey = re.sub(r'\+[0-9.]+', '+W*', c["expr"])
+            if tkey in seen_templates:
+                continue
+            seen_templates.add(tkey)
+            total_templates += 1
+            # All 4 weights tested and in failed list?
+            all_tested = all(
+                re.sub(r'\+[0-9.]+', f'+{w}', c["expr"]) in failed_exprs
+                for w in MULT_WEIGHTS
+            )
+            if all_tested:
+                exhausted_count += 1
+        if total_templates > 0 and exhausted_count / total_templates >= 0.5:
+            mult_exhausted = True
+            log(f"  🔄 MULT exhausted: {exhausted_count}/{total_templates} templates fully tested, skipping")
+    
+    result = []
+    
+    # ── Phase 0: MULT (only if not exhausted) ──
+    if rotation_phase == 0 and mult_pool and not mult_exhausted:
+        # Pick one per template (weight-agnostic dedup)
+        seen_templates = set()
+        for c in mult_pool:
             if len(result) >= n:
                 break
+            tkey = re.sub(r'\+[0-9.]+\*\w+\(.*\)$', '', c["expr"])
+            if tkey in seen_templates:
+                continue
+            seen_templates.add(tkey)
             result.append(c)
+        log(f"  🟢 Phase 0: trying {len(result)} MULT candidates (template-deduped)")
+    
+    # ── Phase 1: no-ratio skeletons (DIRECT_RANK + PURE_ADD) ──
+    if rotation_phase == 1 or (rotation_phase == 0 and mult_exhausted):
+        tier1 = sorted_group(SKELETON_DIRECT_RANK) + sorted_group(SKELETON_PURE_ADD)
+        tier1.sort(key=_sort_key)
+        result.extend(tier1[:n])
+        if len(result) < n:
+            tier2 = sorted_group(SKELETON_THREE_TERM) + sorted_group(SKELETON_PURE_MULT)
+            tier2.sort(key=_sort_key)
+            result.extend(tier2[:n - len(result)])
+        log(f"  🔵 Phase 1: trying {len(result)} no-ratio candidates")
+    
+    # ── Phase 2: mixed exploration skeletons ──
+    if rotation_phase == 2 or (rotation_phase == 0 and mult_exhausted and not result):
+        tier1 = (sorted_group(SKELETON_IND_NEUT) + sorted_group(SKELETON_THREE_TERM) +
+                 sorted_group(SKELETON_PURE_MULT) + sorted_group(SKELETON_SUB))
+        tier1.sort(key=_sort_key)
+        # Within tier1, prefer skeletons with fewest occurrences in active
+        result.extend(tier1[:n])
+        if len(result) < n:
+            tier2 = sorted_group(SKELETON_DIRECT_RANK) + sorted_group(SKELETON_PURE_ADD)
+            tier2.sort(key=_sort_key)
+            result.extend(tier2[:n - len(result)])
+        log(f"  🟣 Phase 2: trying {len(result)} exploration candidates")
+    
+    result = result[:n]
     
     for c in result:
         log(f"  🎯 [{c.get('skeleton','?')[:4].upper()}] {c['name']}")
