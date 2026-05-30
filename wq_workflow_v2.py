@@ -527,7 +527,11 @@ def _build_ratio_pool(ortho: dict, skip_zero_occupancy: bool = False) -> list:
     return pool
 
 def _generate_mult_candidates(ratio_pool: list, ortho: dict, active_exprs: list) -> list:
-    """Generate multiplication skeleton candidates: rank(A/B)*rank(C/D)+W*rank(M)."""
+    """Generate multiplication skeleton candidates: rank(A/B)*rank(C/D)+W*rank(M).
+
+    Builds TEMPLATES (unique field combinations), scores each template,
+    then picks best weight per template to produce diverse candidates.
+    """
     candidates = []
     momentums = [
         ("ts_mean(volume,5)", "vol_mom"),
@@ -538,6 +542,9 @@ def _generate_mult_candidates(ratio_pool: list, ortho: dict, active_exprs: list)
         ("ts_mean(returns,5)", "ret_tre"),
     ]
     seen = set()
+    # Step 1: Build templates — unique (r1, r2, mom) templates
+    templates = []
+    template_seen = set()
     for (r1_str, r1_name) in ratio_pool[:5]:
         r1_fields = set(FIELD_PATTERN.findall(r1_str))
         for (r2_str, r2_name) in ratio_pool[:5]:
@@ -546,25 +553,41 @@ def _generate_mult_candidates(ratio_pool: list, ortho: dict, active_exprs: list)
             r2_fields = set(FIELD_PATTERN.findall(r2_str))
             if r1_fields & r2_fields:
                 continue
-            # Check group compatibility: both ratios must be same group
             all_groups = {_get_field_group(f) for f in (r1_fields | r2_fields)}
             if len(all_groups) > 1:
                 continue
             for mom_str, mom_name in momentums[:3]:
-                for w in [0.3, 0.5, 0.7]:
-                    expr = f"{r1_str}*{r2_str}+{w}*rank({mom_str})"
-                    if expr in seen:
-                        continue
-                    seen.add(expr)
-                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
-                    name = f"M_{r1_name}_{r2_name}_{mom_name}_w{int(w*10)}"[:40]
-                    name = name.replace("-","_").replace(" ","")
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score,
-                        "skeleton": SKELETON_MULT,
-                        "weight": w,
-                    })
+                tkey = (r1_str, r2_str, mom_str)
+                if tkey in template_seen:
+                    continue
+                template_seen.add(tkey)
+                # Score the template (median weight as representative)
+                median_expr = f"{r1_str}*{r2_str}+0.5*rank({mom_str})"
+                score = score_candidate_orthogonality(median_expr, ortho, active_exprs)
+                templates.append({
+                    "r1_str": r1_str, "r1_name": r1_name,
+                    "r2_str": r2_str, "r2_name": r2_name,
+                    "mom_str": mom_str, "mom_name": mom_name,
+                    "score": score,
+                })
+    templates.sort(key=lambda t: -t["score"])
+
+    # Step 2: For top templates, generate all weight variants
+    for tmpl in templates:
+        for w in [0.3, 0.5, 0.7]:
+            expr = f"{tmpl['r1_str']}*{tmpl['r2_str']}+{w}*rank({tmpl['mom_str']})"
+            if expr in seen:
+                continue
+            seen.add(expr)
+            name = f"M_{tmpl['r1_name']}_{tmpl['r2_name']}_{tmpl['mom_name']}_w{int(w*10)}"[:40]
+            name = name.replace("-","_").replace(" ","")
+            candidates.append({
+                "name": name, "expr": expr,
+                "orthogonality_score": tmpl["score"],  # template score, not per-variant
+                "skeleton": SKELETON_MULT,
+                "weight": w,
+            })
+
     candidates.sort(key=lambda x: -x["orthogonality_score"])
     return candidates
 
@@ -1144,51 +1167,40 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         seen_exprs.add(c["expr"])
         deduped.append(c)
     
-    # Sort by orthogonality score, with skeleton preference for novel structures
-    # Novel structures get a boost because they're structurally distinct from the 15 existing ACTIVE
-    # When stuck (stuck_batches >= 2), DIRECT_RANK gets maximum priority — it's the only skeleton
-    # proven to avoid S=None (no ratio pairs = no coverage mismatch)
-    NOVEL_SKELETONS = {SKELETON_PURE_ADD, SKELETON_PURE_MULT, SKELETON_DIRECT_RANK,
-                       SKELETON_THREE_TERM, SKELETON_IND_NEUT}
-    direct_rank_boost = 20 if stuck_batches >= 2 else 0
+# ── Tiered selection: MULT is primary — proven working in TOP3000 ──
+    # Non-MULT skeletons (subtraction, IND_NEUT, DIRECT_RANK, add, etc.)
+    # systematically produce S=None in TOP3000. Only use them if MULT pool
+    # doesn't have enough candidates to fill the batch.
+    # Within MULT, pick one per template (field combo) for diversity.
+    mult_pool = [c for c in deduped if c.get("skeleton") == SKELETON_MULT]
+    other_pool = [c for c in deduped if c.get("skeleton") != SKELETON_MULT]
+    
     def _sort_key(c):
-        base = c["orthogonality_score"]
-        if c.get("skeleton") == SKELETON_DIRECT_RANK:
-            base += direct_rank_boost  # Maximum priority when stuck
-        elif c.get("skeleton") in NOVEL_SKELETONS:
-            base += 8  # Strong preference for novel structures
-        elif c.get("skeleton") == SKELETON_MULT:
-            base += 5  # MULT still preferred over saturated SUB
-        return -base
-
-    deduped.sort(key=_sort_key)
+        return -c["orthogonality_score"]
     
-    # Final selection: top-n, ensuring skeleton diversity
-    result = []
-    seen_skeletons = set()
-    for c in deduped:
-        if len(result) >= n:
+    mult_pool.sort(key=_sort_key)
+    other_pool.sort(key=_sort_key)
+    
+    # Select from MULT: group by template (r1+r2+mom), pick best weight per template
+    seen_templates = set()
+    mult_selected = []
+    for c in mult_pool:
+        if len(mult_selected) >= n:
             break
-        # P3: when stuck, bypass diversity constraint — DIRECT_RANK must dominate
-        if stuck_batches >= 2:
-            result.append(c)
+        # Template key: strip weight to get the base field combination
+        import re
+        tkey = re.sub(r'\+[0-9.]+[\*]rank\([^)]+\)$', '', c["expr"])
+        if tkey in seen_templates:
             continue
-        # Prefer diverse skeletons
-        sk = c.get("skeleton", "")
-        if sk in seen_skeletons and len(seen_skeletons) < 2 and len([x for x in deduped if x.get("skeleton") != sk]) > 0:
-            # Skip if we already have this skeleton and there's a different one available
-            # But accept if we've exhausted other skeletons
-            continue
-        seen_skeletons.add(sk)
-        result.append(c)
+        seen_templates.add(tkey)
+        mult_selected.append(c)
     
-    # Fill remaining slots if we had skeleton diversity constraint
+    result = mult_selected[:n]
     if len(result) < n:
-        for c in deduped:
+        for c in other_pool:
             if len(result) >= n:
                 break
-            if c not in result:
-                result.append(c)
+            result.append(c)
     
     for c in result:
         log(f"  🎯 [{c.get('skeleton','?')[:4].upper()}] {c['name']}")
@@ -1437,9 +1449,13 @@ class Workflow:
                 quick_pass = self._quick_test(cand)
                 if quick_pass == "skip":
                     log(f"⏩ {cand['name']}: S=None detected, skip (dead pair)")
+                    self.state["batch_progress"] = idx + 1
+                    self.save_checkpoint()
                     continue
                 if not quick_pass:
                     log(f"⏩ {cand['name']}: quick test failed, skip (S<1.0)")
+                    self.state["batch_progress"] = idx + 1
+                    self.save_checkpoint()
                     continue
                 
                 # ── 4b. FULL SIM → Adaptive IS Poll ──
@@ -1447,11 +1463,13 @@ class Workflow:
                 self.save_checkpoint()
                 success = self._run_full_sim(cand)
                 if not success:
-                    log(f"❌ {cand['name']}: IS failed, trying tune...")
                     success = self._tune_and_retry(cand, ortho, "is")
                     if not success:
                         log(f"✖️ {cand['name']}: all IS variations failed, skip")
-                        notify(f"候选失败 ✖️ {cand['name']}\\nIS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败",
+                        self.state["batch_progress"] = idx + 1
+                        self.save_checkpoint()
+                        notify(f"候选失败 ✖️ {cand['name']}\
+IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败",
                                emoji="⚠️", dedup_key=f"cand_fail_{cand.get('alpha_id','')}")
                         continue
                 elif cand.get("is_status") == "TUNE":
@@ -1459,7 +1477,9 @@ class Workflow:
                     success = self._tune_and_retry(cand, ortho, "is")
                     if not success:
                         log(f"✖️ {cand['name']}: tune also couldn't fix checks, skip")
-                        notify(f"调参未修复 ⚠️ {cand['name']}\\nS={cand.get('sharpe','?')} 调参后仍无法通过check",
+                        self.state["batch_progress"] = idx + 1
+                        self.save_checkpoint()
+                        notify(f"调参未修复 ⚠️ {cand['name']}\nS={cand.get('sharpe','?')} 调参后仍无法通过check",
                                emoji="⚠️", dedup_key=f"tune_fail_{cand.get('alpha_id','')}")
                         continue
                 
@@ -1488,18 +1508,24 @@ class Workflow:
                     success = self._tune_and_retry(cand, ortho, "sc")
                     if not success:
                         log(f"✖️ {cand['name']}: all SC variations failed, skip")
+                        self.state["batch_progress"] = idx + 1
+                        self.save_checkpoint()
                         notify(f"SC耗尽 ✖️ {cand['name']}\nSC={cand.get('sc_value','?')}，换字段调参后仍失败",
                                emoji="⚠️", dedup_key=f"sc_fail_{cand.get('alpha_id','')}")
                         continue
-                
-                # ── 4c. SUBMIT ──
+
+                # ── 4e. SUBMIT ──
                 self.state["phase"] = "submit"
                 self.save_checkpoint()
                 self._submit_alpha(cand, cand.get("alpha_id"))
+                self.state["batch_progress"] = idx + 1
+                self.save_checkpoint()
         
+        # ──AFTER BATCH DONE─debug─
+        log(f"    🔍 POST-LOOP: n={len(candidates)} submitted={[c.get('submitted') for c in candidates]} stuck_before={self.state.get('stuck_batches',0)}")
         # After batch done, save and loop back
-        self.state["candidates_generated"] += len(candidates)
-        self.state["iterations"] += 1
+        self.state["candidates_generated"] = self.state.get("candidates_generated", 0) + len(candidates)
+        self.state["iterations"] = self.state.get("iterations", 0) + 1
         
         # ── Track batch success / stuck detection ──
         any_passed = any(c.get("submitted") for c in candidates)
@@ -2075,19 +2101,20 @@ class Workflow:
             var["fitness"] = stats.get("fitness")
             passes = sum(1 for c in checks if c.get("result") == "PASS")
             fails = sum(1 for c in checks if c.get("result") == "FAIL")
-            is_pass = (fails <= 1 and passes >= 6)
-            # Soft pass in tune: S >= 1.25 with minor check misses → still counts as success
             sharpe_val = stats.get("sharpe")
+            # P1: S=None means dead pair — don't treat as PASS even if checks look good
+            is_pass = (sharpe_val is not None and fails <= 1 and passes >= 6)
+            # Soft pass in tune: S >= 1.25 with minor check misses → still counts as success
             soft_pass = (sharpe_val is not None and sharpe_val >= 1.25
                          and fails <= 2 and passes >= 4 and not is_pass)
 
             log(f"    IS: S={var['sharpe']} F={var['fitness']} | {passes}P/{fails}F")
 
             if not (is_pass or soft_pass):
-                if var['sharpe'] is None:
-                    log(f"    ❌ IS failed: S=None (dead pair), skipping remaining tunes")
-                    break
                 log(f"    ❌ IS failed")
+                if var['sharpe'] is None:
+                    log(f"    S=None (dead pair), skipping remaining tunes")
+                    break
                 continue
 
             if soft_pass:
