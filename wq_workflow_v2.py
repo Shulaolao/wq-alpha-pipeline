@@ -146,6 +146,8 @@ def load_state() -> dict:
         "errors": [],
         "started_at": None,
         "last_updated": None,
+        "failed_expressions": [],   # expressions that have been fully exhausted
+        "stuck_batches": 0,          # consecutive batches with 0 passes
     }
 
 def save_state(state: dict):
@@ -154,6 +156,81 @@ def save_state(state: dict):
     if len(state.get("errors", [])) > 20:
         state["errors"] = state["errors"][-20:]
     STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+
+# ═══ Proxy / Connectivity ═══════════════════════════
+CLASH_SOCK = "/tmp/verge/verge-mihomo.sock"
+def _clash_switch(node_name: str, group: str = "🚀节点选择") -> bool:
+    """Switch Clash proxy node via Unix socket. Returns True on success."""
+    import subprocess, urllib.parse
+    encoded_group = urllib.parse.quote(group, safe="")
+    body = json.dumps({"name": node_name})
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "--max-time", "5",
+             "--unix-socket", CLASH_SOCK, "-X", "PUT",
+             f"http://localhost/proxies/{encoded_group}",
+             "-H", "Content-Type: application/json",
+             "-d", body],
+            capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _clash_get_current(group: str = "🚀节点选择") -> str:
+    """Get current node name for a Clash proxy group."""
+    import subprocess, urllib.parse
+    encoded_group = urllib.parse.quote(group, safe="")
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "--max-time", "5",
+             "--unix-socket", CLASH_SOCK,
+             f"http://localhost/proxies/{encoded_group}"],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout:
+            data = json.loads(r.stdout)
+            return data.get("now", "")
+    except Exception:
+        pass
+    return ""
+
+# Known-working proxy nodes for WQ API (US/Singapore nodes with good TLS to AWS US-East)
+WQ_FALLBACK_NODES = [
+    "🇺🇸美国圣何塞01 | 三网推荐",
+    "🇸🇬AWS新加坡03 | 移动联通推荐",
+    "🇺🇸美国圣何塞01-0.1倍",
+    "🇸🇬新加坡 | 高速专线-hy2",
+    "🇸🇬新加坡3 | 高速专线-hy2",
+]
+
+def ensure_wq_connectivity(s: requests.Session) -> bool:
+    """Test WQ API connectivity; on SSL failure, auto-switch proxy nodes."""
+    import subprocess
+    for attempt in range(4):
+        try:
+            r = s.post(f"{API}/authentication", auth=(EMAIL, PASS), timeout=20)
+            log(f"📡 WQ API reachable (HTTP {r.status_code})")
+            return True
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError) as e:
+            current_node = _clash_get_current()
+            err = str(e)[:80]
+            if attempt >= 3:
+                log(f"❌ WQ unreachable after all proxy switches: {err}", "error")
+                return False
+            log(f"⚠️ WQ SSL error (node={current_node}): {err}", "warn")
+            # Try next fallback node
+            if attempt < len(WQ_FALLBACK_NODES):
+                node = WQ_FALLBACK_NODES[attempt]
+                log(f"  🔄 Switching to {node}...")
+                if _clash_switch(node):
+                    log(f"  ✅ Switched to {node}")
+                    time.sleep(1)  # Let proxy settle
+                else:
+                    log(f"  ⚠️ Switch to {node} failed, trying next")
+        except Exception as e:
+            log(f"⚠️ WQ connectivity error: {e}", "error")
+            return False
+    return False
 
 # ═══ Session ═══════════════════════════════════════
 def fresh_session() -> requests.Session:
@@ -164,6 +241,14 @@ def fresh_session() -> requests.Session:
     import os
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "http://127.0.0.1:7897"
     s.proxies = {"http": proxy, "https": proxy}
+    # Pre-flight connectivity check with auto proxy failover
+    if not ensure_wq_connectivity(s):
+        raise RuntimeError(
+            "WQ API unreachable. Check proxy/network.\n"
+            "  ⚠️  This environment (China) requires a US/Singapore proxy node to reach WQ.\n"
+            "  💡  The auto-switch tried: " + ", ".join(WQ_FALLBACK_NODES) + "\n"
+            "  🔧  Manually switch Clash to a US/Singapore node and retry."
+        )
     r = s.post(f"{API}/authentication", auth=(EMAIL, PASS), timeout=60)
     if r.status_code == 201:
         log("🔐 Auth OK")
@@ -331,15 +416,19 @@ def _get_skeleton_type(expr: str) -> str:
         return SKELETON_SUB
     return SKELETON_SINGLE
 
-def _build_ratio_pool(ortho: dict) -> list:
+def _build_ratio_pool(ortho: dict, skip_zero_occupancy: bool = False) -> list:
     """
     Build list of (expr_str, name) for ratio pairs, filtered by:
     1. Time-frequency compatibility (no pv1/fund mixing)
     2. Field usage < threshold
     3. Unused pair
+    
+    When skip_zero_occupancy=True, skip zero-usage fields that have been
+    proven to produce S=None in TOP3000 (ebitda, cash, sales) in ALL passes.
     """
     field_usage = ortho["fields_used"]
     used_pairs = ortho["field_pairs_used"]
+    zero_usage_fields = {"ebitda", "cash", "sales"}
     
     # Priority: verified pairs (known working), then low-usage fields
     pool = []
@@ -347,6 +436,11 @@ def _build_ratio_pool(ortho: dict) -> list:
     
     # First pass: verified pairs from history
     for num, den in VERIFIED_NUM_DEN_PAIRS:
+        if skip_zero_occupancy:
+            # Skip zero-usage fields from verified pairs too — they're
+            # proven dead-ends in TOP3000 despite having positive IS history
+            if num in zero_usage_fields or den in zero_usage_fields:
+                continue
         num_group = _get_field_group(num)
         den_group = _get_field_group(den)
         if num_group != den_group:
@@ -380,6 +474,8 @@ def _build_ratio_pool(ortho: dict) -> list:
     # Third pass: zero-usage fields
     zero = ortho.get("zero_usage_fields", [])
     for f in zero[:6]:
+        if skip_zero_occupancy and f in {"ebitda", "cash", "sales"}:
+            continue  # Skip fields proven to produce S=None
         for den in ["cap", "enterprise_value", "equity"]:
             if den == f:
                 continue
@@ -470,19 +566,73 @@ def _generate_sub_candidates(ratio_pool: list, ortho: dict, active_exprs: list) 
     candidates.sort(key=lambda x: -x["orthogonality_score"])
     return candidates
 
-def generate_candidates(ortho: dict, active_exprs: list, n: int = 3) -> list:
+
+def _generate_fund_growth_sub_candidates(ortho: dict, active_exprs: list) -> list:
+    """
+    Generate subtraction candidates using FUNDAMENTAL GROWTH RATES.
+    Key insight: rank(ts_delta(ratio, N)) maintains frequency consistency
+    with other fundamental operators, avoiding the S=None coverage mismatch.
+    Pattern: -1*rank(ts_delta(ratio, N)) + rank(daily_signal)
+    Based on working pattern from: E5kZ7p60 = -1*rank(ts_delta(close,5)) + rank(operating_income/equity)
+    """
+    candidates = []
+    # Fundamental ratios that have been verified as working
+    fund_ratios = [
+        ("revenue/equity", "rev_eq"),
+        ("operating_income/equity", "oi_eq"),
+        ("revenue/enterprise_value", "rev_ev"),
+        ("operating_income/cap", "oi_cap"),
+        ("debt/equity", "de"),
+        ("debt/enterprise_value", "de_ev"),
+        ("revenue/cap", "rev_cap"),
+    ]
+    # Daily signals to ADD (not subtract) — momentum/reversal signals
+    daily_signals = [
+        ("ts_delta(close, 5)", "delta_close_5"),
+        ("ts_delta(close, 10)", "delta_close_10"),
+        ("-1*ts_delta(close, 5)", "neg_delta_close_5"),
+        ("-1*ts_delta(close, 10)", "neg_delta_close_10"),
+        ("ts_zscore(close, 20)", "zsc_close_20"),
+        ("ts_rank(returns, 20)", "rank_ret_20"),
+    ]
+    seen = set()
+    for (ratio, ratio_name) in fund_ratios:
+        for (signal, sig_name) in daily_signals:
+            # Pattern: fundamental + daily_signal (addition, not subtraction)
+            # This matches working alphas: E5kZ7p60, rKA3vKra
+            expr = f"-1*rank({signal}) + rank({ratio})"
+            if expr in seen:
+                continue
+            seen.add(expr)
+            score = score_candidate_orthogonality(expr, ortho, active_exprs)
+            name = f"S_g{ratio_name}_{sig_name}"[:40]
+            name = name.replace("-","_").replace(" ","")
+            candidates.append({
+                "name": name, "expr": expr,
+                "orthogonality_score": score,
+                "skeleton": SKELETON_SUB,
+                "weight": 0.5,
+            })
+    candidates.sort(key=lambda x: -x["orthogonality_score"])
+    return candidates
+
+def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
+                        failed_exprs: list = None, stuck_batches: int = 0) -> list:
     """
     v3: AST-aware candidate generation with time-frequency filtering.
     
     Decision tree:
     1. If multiplication skeleton < 2 in active → generate MULT candidates
     2. If multiplication >= 2 → generate SUB candidates instead
-    3. Final selection: pick top-n with diverse ratio pairs
+    3. When stuck (stuck_batches >= 2): skip zero-occupancy fields, force
+       proven field templates to break out of the dead-end loop
+    4. Final selection: pick top-n with diverse ratio pairs
     
     Never mixes pv1 and fundamental fields in the same ratio pair.
     Never reuses exact field pairs from active alphas.
+    Never regenerates expressions that are in failed_exprs list.
     """
-    ratio_pool = _build_ratio_pool(ortho)
+    ratio_pool = _build_ratio_pool(ortho, skip_zero_occupancy=(stuck_batches >= 2))
     
     if not ratio_pool:
         log("  ⚠️ No ratio pairs available for generation!")
@@ -506,7 +656,12 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3) -> list:
     if use_sub:
         log("  🔵 Generating SUBTRACTION candidates (multiplication saturated)")
         sub_candidates = _generate_sub_candidates(ratio_pool, ortho, active_exprs)
+        # Also try growth-based subtraction (fundamental + daily signal addition)
+        # This pattern avoids the coverage mismatch of rank(fundamental) - rank(ts_delta(daily))
+        growth_sub = _generate_fund_growth_sub_candidates(ortho, active_exprs)
+        log(f"  📈 Adding {len(growth_sub)} fundamental growth subtraction candidates")
         all_candidates.extend(sub_candidates)
+        all_candidates.extend(growth_sub)
     
     if not all_candidates:
         log("  ⚠️ No candidates generated!")
@@ -514,6 +669,10 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3) -> list:
     
     # Deduplicate by expression
     seen_exprs = set()
+    # Also track failed expressions to avoid regenerating dead-end candidates
+    if failed_exprs:
+        for fe in failed_exprs:
+            seen_exprs.add(fe)
     deduped = []
     for c in all_candidates:
         if c["expr"] in seen_exprs:
@@ -764,7 +923,11 @@ class Workflow:
             self.save_checkpoint()
             
             # 3. Generate candidates
-            candidates = generate_candidates(ortho, [a["expr"] for a in actives], n=3)
+            candidates = generate_candidates(
+                ortho, [a["expr"] for a in actives], n=3,
+                failed_exprs=self.state.get("failed_expressions", []),
+                stuck_batches=self.state.get("stuck_batches", 0),
+            )
             if not candidates:
                 log("❌ No candidates generated — platform may need new data sources", "error")
                 time.sleep(3600)
@@ -826,6 +989,28 @@ class Workflow:
         # After batch done, save and loop back
         self.state["candidates_generated"] += len(candidates)
         self.state["iterations"] += 1
+        
+        # ── Track batch success / stuck detection ──
+        any_passed = any(c.get("submitted") for c in candidates)
+        if any_passed:
+            self.state["stuck_batches"] = 0
+        else:
+            self.state["stuck_batches"] = self.state.get("stuck_batches", 0) + 1
+            # Register failed expressions for dead-end detection
+            failed_list = self.state.setdefault("failed_expressions", [])
+            for c in candidates:
+                expr = c.get("expr", "")
+                if expr and expr not in failed_list:
+                    failed_list.append(expr)
+                    log(f"  📝 Registered failed expr ({len(failed_list)} total): {expr[:60]}")
+            # Keep list bounded
+            if len(failed_list) > 50:
+                self.state["failed_expressions"] = failed_list[-50:]
+            if self.state["stuck_batches"] >= 3:
+                log(f"⚠️  {self.state['stuck_batches']} consecutive batches with 0 passes. "
+                    f"Switching to stuck mode (skip zero-occupancy fields).",
+                    "warn")
+        
         self.save_checkpoint()
         
         log(f"\n🔄 Batch complete. Current: {self.state['active_count']}/{TARGET_ACTIVE}")
@@ -868,7 +1053,10 @@ class Workflow:
         if sharpe is not None and sharpe < 1.0:
             log(f"⏩ Quick test: S={sharpe:.2f} < 1.0, skipping")
             return False
-        log(f"⏩ Quick test: S={sharpe} >= 1.0, proceeding to full sim")
+        if sharpe is not None:
+            log(f"⏩ Quick test: S={sharpe:.2f} >= 1.0, proceeding to full sim")
+        else:
+            log(f"⏩ Quick test: S=None (pass-through), proceeding to full sim")
         return True
 
     def _run_full_sim(self, cand: dict) -> bool:
@@ -1082,12 +1270,12 @@ class Workflow:
             # Variation 1: Different momentum operator
             mom_variants = [
                 ("rank(ts_mean(volume,5))", "vol_mom"),
-                ("rank(ts_std(returns,5))", "ret_vol"),
                 ("rank(ts_mean(adv20,5))", "adv_mom"),
                 ("rank(log(adv20))", "log_adv"),
                 ("rank(ts_mean(low,5))", "low_mom"),
                 ("rank(ts_corr(close,volume,10))", "corr_cv"),
             ]
+            # NOTE: "rank(ts_std(returns,5))" removed — always stalls at 0% on WQ engine
             
             # Extract the ratio prefix (everything before the last +)
             # Base format: ratio1*ratio2+W*rank(momentum)
@@ -1134,7 +1322,7 @@ class Workflow:
                                     continue
                                 if {num, den} & {num2, den2}:
                                     continue
-                                for (mom, mom_name) in [("ts_mean(volume,5)", "vol_mom"), ("ts_std(returns,5)", "ret_vol")]:
+                                for (mom, mom_name) in [("ts_mean(volume,5)", "vol_mom")]:
                                     for w in [0.5, 0.7]:
                                         expr = f"rank({num}/{den})*rank({num2}/{den2})+{w}*rank({mom})"
                                         if expr not in [v["expr"] for v in variations]:
@@ -1154,25 +1342,25 @@ class Workflow:
                             break
                     if pair_count >= max_tune_attempts - len(variations):
                         break
-        
+
         else:
             # SC failure: try entirely different field pairs
             # Use the orthogonality data to find the most orthogonal field combinations
             field_usage = ortho["fields_used"]
             used_pairs = ortho.get("field_pairs_used", set())
-            
+
             denoms = ["cap", "high", "open", "low", "sales", "enterprise_value", "equity"]
             denoms = [d for d in denoms if field_usage.get(d, 0) <= 2]
-            
+
             nums = [f for f in ALL_WQ_FIELDS if field_usage.get(f, 0) <= 1]
             nums = [n for n in nums if n not in ["close"]]  # exclude close (too common)
-            
+
             mom_pool = [
                 ("ts_mean(volume,5)", "vol_mom"),
-                ("ts_std(returns,5)", "ret_vol"),
                 ("ts_mean(adv20,5)", "adv_mom"),
                 ("log(volume)", "log_vol"),
             ]
+            # NOTE: "ts_std(returns,5)" removed from all pools — always stalls at 0%
             
             pair_count = 0
             for num in nums[:6]:
