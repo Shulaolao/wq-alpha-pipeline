@@ -157,6 +157,8 @@ def load_state() -> dict:
         "last_updated": None,
         "failed_expressions": [],   # expressions that have been fully exhausted
         "stuck_batches": 0,          # consecutive batches with 0 passes
+        "batches_since_optimization": 0,  # batches since last meta-optimization
+        "last_optimization_at": None,     # ISO timestamp of last optimization run
     }
 
 def save_state(state: dict):
@@ -1644,7 +1646,10 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                 log(f"⚠️  {self.state['stuck_batches']} consecutive batches with 0 passes. "
                     f"Switching to stuck mode (skip zero-occupancy fields).",
                     "warn")
-        
+
+        # ── Track meta-optimization counters ──
+        self.state["batches_since_optimization"] = self.state.get("batches_since_optimization", 0) + 1
+
         self.save_checkpoint()
         
         log(f"\n🔄 Batch complete. Current: {self.state['active_count']}/{TARGET_ACTIVE}")
