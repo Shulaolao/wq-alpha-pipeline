@@ -1657,7 +1657,7 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
         if r2.status_code != 200:
             return True
         body = r2.json()
-        stats = body.get("is", {}).get("statistics", {}) if isinstance(body.get("is"), dict) else {}
+        stats = body.get("is", {}) if isinstance(body.get("is"), dict) else {}
         sharpe = stats.get("sharpe")
         log(f"⏩ Quick test: S={sharpe}")
         # S=None = coverage mismatch / dead pair — skip entire candidate
@@ -1727,7 +1727,7 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
 
         ad = r2.json()
         checks = ad.get("is", {}).get("checks", []) if isinstance(ad.get("is"), dict) else []
-        stats = ad.get("is", {}).get("statistics", {}) if isinstance(ad.get("is"), dict) else {}
+        stats = ad.get("is", {}) if isinstance(ad.get("is"), dict) else {}
 
         cand["sharpe"] = stats.get("sharpe")
         cand["fitness"] = stats.get("fitness")
@@ -2168,7 +2168,7 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             
             ad = r2.json()
             checks = ad.get("is", {}).get("checks", []) if isinstance(ad.get("is"), dict) else []
-            stats = ad.get("is", {}).get("statistics", {}) if isinstance(ad.get("is"), dict) else {}
+            stats = ad.get("is", {}) if isinstance(ad.get("is"), dict) else {}
             
             var["sharpe"] = stats.get("sharpe")
             var["fitness"] = stats.get("fitness")
