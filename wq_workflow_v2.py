@@ -2222,6 +2222,10 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             if soft_pass:
                 log(f"    ✅ Soft IS pass (S={sharpe_val:.2f}, {passes}P/{fails}F) — metrics strong, accepting as tune success")
             
+            # Notify: 调参成功
+            notify(f"调参成功 ✅ {var['name']}\nS={sharpe_val:.2f} F={var.get('fitness','?')}\n{var['expr'][:80]}",
+                   emoji="✅", dedup_key=f"tune_success_{alpha_id}")
+            
             # Set metadata
             try:
                 self.s.patch(f"{API}/alphas/{alpha_id}",
