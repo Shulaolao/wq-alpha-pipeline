@@ -1182,14 +1182,14 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     other_pool.sort(key=_sort_key)
     
     # Select from MULT: group by template (r1+r2+mom), pick best weight per template
+    import re
     seen_templates = set()
     mult_selected = []
     for c in mult_pool:
         if len(mult_selected) >= n:
             break
         # Template key: strip weight to get the base field combination
-        import re
-        tkey = re.sub(r'\+[0-9.]+[\*]rank\([^)]+\)$', '', c["expr"])
+        tkey = re.sub(r'\+[0-9.]+\*\w+\(.*\)$', '', c["expr"])
         if tkey in seen_templates:
             continue
         seen_templates.add(tkey)
@@ -1449,6 +1449,14 @@ class Workflow:
                 quick_pass = self._quick_test(cand)
                 if quick_pass == "skip":
                     log(f"⏩ {cand['name']}: S=None detected, skip (dead pair)")
+                    # Immediately register failed expression so it's skipped next batch
+                    failed_list = self.state.setdefault("failed_expressions", [])
+                    expr = cand.get("expr", "")
+                    if expr and expr not in failed_list:
+                        failed_list.append(expr)
+                        if len(failed_list) > 50:
+                            self.state["failed_expressions"] = failed_list[-50:]
+                        log(f"  📝 Registered dead pair ({len(failed_list)} total)")
                     self.state["batch_progress"] = idx + 1
                     self.save_checkpoint()
                     continue
