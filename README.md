@@ -10,104 +10,153 @@
 
 ## 完整工作流
 
-```mermaid
-flowchart TB
-    START(["🏁 launchd 启动"]) --> MAIN_LOOP{"_main_loop()<br/>while running"}
-
-    subgraph STEP1 [1️⃣ 正交分析 Orthogonality]
-        MAIN_LOOP --> FETCH["fetch_active_alphas()<br/>获取当前 ACTIVE 列表"]
-        FETCH --> ORTHO["analyze_orthogonality()<br/>字段使用频率 + AST 骨架分析"]
-        ORTHO --> CHECK_COUNT{"active_count >= 20?"}
-        CHECK_COUNT -->|"✅ 已达目标"| DONE(["🏆 TARGET REACHED"])
-        CHECK_COUNT -->|"继续挖掘"| GEN
-    end
-
-    subgraph STEP2 [2️⃣ 候选生成 Generate]
-        GEN["generate_candidates()"] --> EXHAUST{"MULT 模板<br/>已耗尽 ≥50%?"}
-        EXHAUST -->|"是"| SKIP_MULT["跳过 MULT 骨架"]
-        EXHAUST -->|"否"| ROTATE{"rotation_phase =<br/>stuck_batches % 3"}
-
-        ROTATE -->|"Phase 0: MULT"| MULT_PHASE["MULT 骨架<br/>rank(A/B)*rank(C/D)+W*rank(M)"]
-        ROTATE -->|"Phase 1: DIRECT_RANK"| DR_PHASE["DIRECT_RANK + PURE_ADD<br/>rank(A)±W*rank(B) | rank(A/B)+rank(C/D)"]
-        ROTATE -->|"Phase 2: 混合探索"| MIX_PHASE["THREE_TERM + IND_NEUT + SUB<br/>rank(A/B)+rank(C/D)-W*rank(ts) | ..."]
-
-        SKIP_MULT --> DR_PHASE
-        MULT_PHASE --> DEDUP["模板去重: 每字段组合取最优权重"]
-        DR_PHASE --> PICK3["取 top-N 候选 → batch_progress=0"]
-        MIX_PHASE --> PICK3
-        DEDUP --> PICK3
-    end
-
-    subgraph STEP3 [3️⃣ Quick Test 快速过滤]
-        PICK3 --> FOR_EACH["for each candidate in batch"]
-        FOR_EACH --> QT["_quick_test()<br/>P1Y 轻量回测"]
-
-        QT --> QS_CHECK{"sharpe = ?"}
-        QS_CHECK -->|"S=None (死对)"| QS_SKIP["return 'skip'<br/>→ 加入 failed_expressions<br/>→ continue"]
-        QS_CHECK -->|"S < 1.0"| QS_FAIL["return False<br/>→ continue"]
-        QS_CHECK -->|"S ≥ 1.0"| SIM
-    end
-
-    subgraph STEP4 [4️⃣ Full IS 全量回测]
-        SIM["_run_full_sim()<br/>全量设置 5Y 回测"]
-        SIM --> ADAPT_POLL["adaptive_poll()<br/>15s→60s→120s<br/>stuck 300s abort"]
-        ADAPT_POLL --> IS_RESULT{"is_status = ?"}
-
-        IS_RESULT -->|"PASS: S≥1.25, F≥1.0<br/>6P/1F"| OPTIMIZE{"_should_optimize()?<br/>S ≥ 2.0 → 跳过<br/>S < 1.3 或 F < 1.15 → 优化"}
-        IS_RESULT -->|"TUNE: S≥1.25<br/>4P/2F 但不足 6P"| TUNE_IS["_tune_and_retry('is')<br/>网格搜索权重+动量"]
-        IS_RESULT -->|"FAIL"| TUNE_FAIL["_tune_and_retry('is')<br/>救火调参"]
-    end
-
-    TUNE_FAIL --> TUNE_OK{"调参成功?"}
-    TUNE_OK -->|"否"| CAND_FAIL["✖️ 候选丢弃<br/>→ 飞书通知 ⚠️"]
-    TUNE_OK -->|"是"| POLL_IS["重新 IS 轮询"]
-    POLL_IS --> IS_RESULT
-
-    TUNE_IS --> TUNE_OK
-
-    OPTIMIZE -->|"Profile: 高S低F"| OPT_PROF1["动量低权重 [0.3,0.5]<br/>稳定动量 adv20/low/log_adv"]
-    OPTIMIZE -->|"Profile: 高F低S"| OPT_PROF2["动量高权重 [0.7,0.9,1.2]<br/>高信号动量 volume/corr_cv/low"]
-    OPTIMIZE -->|"Profile: 均衡"| OPT_PROF3["全网格 [0.3-0.9]<br/>全部 5 种动量"]
-    OPT_PROF1 --> OPT_TUNE["_tune_and_retry(optimize=True)<br/>最多 8 变体"]
-    OPT_PROF2 --> OPT_TUNE
-    OPT_PROF3 --> OPT_TUNE
-    OPT_TUNE --> OPT_RESULT{"有提升?"}
-    OPT_RESULT -->|"✅ S 提升"| SC["→ 进入 SC"]
-    OPT_RESULT -->|"ℹ️ 无变化"| SC
-    end
-
-    subgraph STEP5 [5️⃣ SC 提交与轮询]
-        SC["_run_sc()<br/>提交 SELF_CORRELATION"]
-        SC --> SC_POLL["adaptive_poll()<br/>30s→120s → SC 结果"]
-        SC_POLL --> SC_CHECK{"SC < 0.90?"}
-        SC_CHECK -->|"通过"| SUBMIT["✅ _submit_alpha()<br/>→ ACTIVE 🎉"]
-        SC_CHECK -->|"失败"| SC_TUNE["_tune_and_retry('sc')<br/>换字段调参"]
-        SC_TUNE --> SC_TUNE_OK{"调参成功?"}
-        SC_TUNE_OK -->|"是"| SC
-        SC_TUNE_OK -->|"否"| SC_FAIL["✖️ SC 耗尽<br/>→ 飞书通知 ⚠️"]
-    end
-
-    FOR_EACH --> NEXT_CAND{"下一个候选?"}
-    NEXT_CAND -->|"是"| FOR_EACH
-    NEXT_CAND -->|"batch 完成"| STUCK
-
-    subgraph STEP6 [6️⃣ Batch 结束 → 卡死检测]
-        STUCK["POST-LOOP 统计"]
-        STUCK --> ANY_PASS{"any(c.submitted) ?"}
-        ANY_PASS -->|"有产出"| RESET_STUCK["stuck_batches = 0"]
-        ANY_PASS -->|"全体失败"| INC_STUCK["stuck_batches += 1<br/>→ 注册失败表达式"]
-        INC_STUCK --> STUCK3{"stuck ≥ 3?"}
-        STUCK3 -->|"是"| STUCK_MODE["⚠️ 卡死模式<br/>跳过零占用字段<br/>DIRECT_RANK 强制优先"]
-        STUCK3 -->|"否"| LOOP_BACK
-        RESET_STUCK --> LOOP_BACK["🔄 while 循环 → 回到正交分析"]
-    end
-
-    SUBMIT --> LOOP_BACK
-
-    %% 飞书通知事件
-    SUBMIT -.-> FEISHU("📨 飞书推送 🎉 新ACTIVE")
-    CAND_FAIL -.-> FEISHU2("📨 飞书推送 ⚠️ 候选失败")
-    SC_FAIL -.-> FEISHU3("📨 飞书推送 ⚠️ SC耗尽")
+```
+                         ┌─────────────────────────────────┐
+                         │        🏁  launchd 守护         │
+                         │  KeepAlive + 30s 自动恢复        │
+                         └──────────────┬──────────────────┘
+                                        │  while running
+                                        ▼
+┌─ 1️⃣ 正交分析 ─────────────────────────────────────────────────┐
+│  ┌──────────────────┐   ┌─────────────────────────────┐      │
+│  │ fetch_actives()  │──▶│ 字段频率 + AST 骨架分析     │      │
+│  └──────────────────┘   └────────────┬────────────────┘      │
+│                                      ▼                       │
+│      ┌─────────────────────────┐                            │
+│      │  active_count ≥ 20?     │──✅──▶ 🏆 TARGET REACHED   │
+│      └────────────┬────────────┘                            │
+└───────────────────┼──────────────────────────────────────────┘
+                    │ 否
+                    ▼
+┌─ 2️⃣ 候选生成 ─────────────────────────────────────────────────┐
+│  ┌─────────────┐    ┌──────────────────┐                     │
+│  │ MULT 模板   │───▶│ 枯竭? (≥50%耗尽) │                     │
+│  │ 已耗尽≥50%? │    └────┬──────┬──────┘                     │
+│  └─────────────┘         │是    │否                          │
+│                          ▼     ▼                             │
+│                 ┌─────────────────┐                          │
+│                 │ stuck_batches   │                          │
+│                 │    % 3 轮转     │                          │
+│                 └───┬──┬───┬─────┘                          │
+│              Phase0 │  │1  │ 2                              │
+│  ┌──────────────────┘  │   └──────────────────┐             │
+│  ▼                     ▼                      ▼              │
+│  MULT               DIRECT_RANK           THREE_TERM         │
+│  rank(A/B)          rank(A)±W*rank(B)     + IND_NEUT + SUB  │
+│  *rank(C/D)         + PURE_ADD            混合探索          │
+│  +W*rank(M)                                                    │
+│       │                 │                      │              │
+│       └────────────┬────┴──────────┬───────────┘              │
+│                    ▼                ▼                         │
+│              模板去重         取 top-N 候选                   │
+└───────────────────┼──────────────────────────────────────────┘
+                    │  for each candidate
+                    ▼
+┌─ 3️⃣ Quick Test (P1Y) ────────────────────────────────────────┐
+│  ┌──────────────────┐                                         │
+│  │  _quick_test()   │                                         │
+│  │  P1Y 轻量回测    │                                         │
+│  └───────┬──────────┘                                         │
+│          ▼                                                     │
+│    ┌──────────┐                                                │
+│    │ S=?      │                                                │
+│    └─┬──┬──┬──┘                                               │
+│  死对│  │弱│强                                                  │
+│      │  │  │                                                   │
+│  ┌───┘  │  └────┐                                             │
+│  ▼      ▼        ▼                                             │
+│ skip  failed   FULL IS                                         │
+│ (S=None) (S<1) (S≥1.0)                                         │
+└──────────────────┼─────────────────────────────────────────────┘
+                   │
+                   ▼
+┌─ 4️⃣ Full IS ──────────────────────────────────────────────────┐
+│  ┌──────────────────┐   ┌─────────────────────┐               │
+│  │ _run_full_sim()  │──▶│ adaptive_poll()     │               │
+│  │ 全量 5Y 回测     │   │ 15s→60s→120s        │               │
+│  └──────────────────┘   │ stuck 300s abort    │               │
+│                         └──────────┬──────────┘               │
+│                                    ▼                          │
+│                           ┌──────────────┐                    │
+│                           │ IS status?   │                    │
+│                           └──┬──┬──┬─────┘                    │
+│                      PASS    │  │  │  TUNE/FAIL               │
+│                   ┌──────────┘  │  └──────────────┐          │
+│                   ▼             ▼                   ▼         │
+│            ┌──────────┐  ┌────────────┐  ┌──────────────┐    │
+│            │ 优化策略  │  │ 调参重试   │  │ 救火调参     │    │
+│            │ S≥2.0跳过 │  │ 网格搜权重 │  │ 换动量+权重  │    │
+│            │ <1.3优化  │  │ +5种动量   │  │ 最多5变体    │    │
+│            └────┬─────┘  └──────┬─────┘  └───────┬──────┘    │
+│                 │               │                 │          │
+│                 └───────────────┴─────────────────┘          │
+│                                │                              │
+│                           ┌────┴─────┐                       │
+│                           │ 成功?     │                       │
+│                           └──┬──┬────┘                       │
+│                         ✅是  │  │  ❌否                      │
+│                             │  │                              │
+│                             ▼  │     ┌─────────────────┐    │
+│                      ┌────────┐│     │ ✖ 候选丢弃     │    │
+│                      │进入SC  ││     │ 飞书通知 ⚠️    │    │
+│                      └────────┘│     └─────────────────┘    │
+└──────────────────────────────────┼──────────────────────────────┘
+                                   │  IS 通过
+                                   ▼
+┌─ 5️⃣ SC 提交 ─────────────────────────────────────────────────┐
+│  ┌──────────────────┐   ┌─────────────────────┐              │
+│  │ _run_sc()        │──▶│ adaptive_poll()     │              │
+│  │ SELF_CORRELATION │   │ 30s→120s            │              │
+│  └──────────────────┘   └──────────┬──────────┘              │
+│                                    ▼                          │
+│                           ┌──────────────┐                    │
+│                           │ SC < 0.90?   │                    │
+│                           └──┬──┬────────┘                    │
+│                    ✅通过    │  │  ❌失败                      │
+│                         ┌───┘  └──────┐                      │
+│                         ▼              ▼                      │
+│              ┌──────────────┐  ┌──────────────┐              │
+│              │ ✅ 提交      │  │ SC 调参重试  │              │
+│              │ → ACTIVE 🎉  │  │ 换字段组合   │              │
+│              │ 飞书通知 🎉  │  │ 最多5变体    │              │
+│              └──────┬───────┘  └───────┬──────┘              │
+│                     │                  │                      │
+│                     │             ┌────┴─────┐               │
+│                     │             │ 成功?     │               │
+│                     │             └──┬──┬────┘               │
+│                     │           ✅是  │  │  ❌否              │
+│                     │                │  ┌────────────────┐  │
+│                     │                │  │ ✖ SC 耗尽     │  │
+│                     │                │  │ 飞书通知 ⚠️   │  │
+│                     ▼                ▼  └────────────────┘  │
+└─────────────────────┼─────────────────────────────────────────┘
+                      │
+                      ▼ batch 完成
+┌─ 6️⃣ 卡死检测 ────────────────────────────────────────────────┐
+│  ┌────────────────┐                                           │
+│  │ batch 有产出?  │                                           │
+│  └──┬──────────┬──┘                                           │
+│  ✅有│          │❌全体失败                                      │
+│      ▼          ▼                                               │
+│  stuck=0     stuck+=1                                          │
+│                 │                                               │
+│            ┌────┴────┐                                         │
+│            │ stuck≥3?│                                         │
+│            └──┬──┬───┘                                         │
+│           ✅是  │  │  ❌否                                      │
+│               │  ▼                                              │
+│     ┌─────────┐  └──┐                                          │
+│     ⚠️ 卡死模式     │                                          │
+│     跳过零占用字段    │                                          │
+│     DIRECT_RANK优先   │                                          │
+│     └────────┘        │                                          │
+└───────────────────────┼──────────────────────────────────────────┘
+                        │
+                        ▼
+               ┌─────────────────┐
+               │ 🔄 while循环    │
+               │ 回到正交分析    │
+               └─────────────────┘
 ```
 
 ### 7 种骨架类型
