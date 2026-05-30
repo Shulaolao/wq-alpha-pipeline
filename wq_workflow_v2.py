@@ -1769,10 +1769,11 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
 
         # P1: S=None means dead pair — don't treat as PASS even if checks look good
         is_pass = (sharpe_val is not None and fails <= 1 and passes >= 6)
-        # Soft pass: metrics strong but checks barely miss → route to tuning
-        soft_pass = (sharpe_val is not None and sharpe_val >= 1.25
-                     and fails <= 2 and passes >= 4
-                     and not is_pass)
+        # Soft pass: S strong or F strong with decent S → route to tuning
+        soft_pass = (sharpe_val is not None and fails <= 2 and passes >= 4
+                     and not is_pass
+                     and (sharpe_val >= 1.25
+                          or (sharpe_val >= 1.0 and fitness_val is not None and fitness_val >= 0.8)))
 
         if is_pass:
             cand["is_status"] = "PASS"
@@ -2206,9 +2207,12 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             sharpe_val = stats.get("sharpe")
             # P1: S=None means dead pair — don't treat as PASS even if checks look good
             is_pass = (sharpe_val is not None and fails <= 1 and passes >= 6)
-            # Soft pass in tune: S >= 1.25 with minor check misses → still counts as success
-            soft_pass = (sharpe_val is not None and sharpe_val >= 1.25
-                         and fails <= 2 and passes >= 4 and not is_pass)
+            # Soft pass in tune: S strong or F strong with decent S → still counts as success
+            fitness_val = var.get("fitness")
+            soft_pass = (sharpe_val is not None and fails <= 2 and passes >= 4
+                         and not is_pass
+                         and (sharpe_val >= 1.25
+                              or (sharpe_val >= 1.0 and fitness_val is not None and fitness_val >= 0.8)))
 
             log(f"    IS: S={var['sharpe']} F={var['fitness']} | {passes}P/{fails}F")
 
