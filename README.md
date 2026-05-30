@@ -50,7 +50,10 @@ open http://localhost:8765
 
 ```
 wq-alpha-pipeline/
-├── wq_workflow_v2.py               # 主工作流 (1343 行)
+├── wq_workflow_v2.py               # 主工作流 (2174 行)
+│   ├── P1(2026-05-30): 修复 S=None 被误判 IS PASS → 死对候选不再浪费 SC slot
+│   ├── P2(2026-05-30): 骨架优先级统一在 _sort_key 管理，移除生成器预加成失真
+│   └── P3(2026-05-30): stuck 模式旁路多样性约束，DIRECT_RANK 优先选入
 ├── scripts/
 │   └── wq_pipeline.py              # 旧版三阶段流水线（已废弃）
 ├── config/
