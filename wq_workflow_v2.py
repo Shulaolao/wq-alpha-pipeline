@@ -889,42 +889,67 @@ def _generate_pure_mult_candidates(ortho: dict, active_exprs: list) -> list:
 
 def _generate_direct_rank_candidates(ortho: dict, active_exprs: list) -> list:
     """
-    gap_fill: direct_rank — rank(A) +/- rank(B)
-    Direct field rank cross-section, no ratio, no time series.
-    Based on working ACTIVE: LLnNAYv1 = rank(debt) - 2*rank(returns)
-    Lowest possible field/operator occupancy. Avoids S=None entirely.
+    gap_fill: direct_rank — rank(A) +/- W*rank(ts_*(B,N))
+    Direct field rank with at least one time-series operator on every expression.
+    Pure cross-section (no ts_*) always returns S=None in WQ.
+    
+    Patterns:
+      - fund + ts_delta(pv1):  rank(fund) - W*rank(ts_delta(close,5))
+      - ts_rank(fund) +/- rank(pv1):  rank(ts_rank(fund,250)) +/- W*rank(pv1)
+      - cross-domain:  rank(fund) - W*rank(returns)  (returns is natively time-series)
     """
     candidates = []
-    # Use fund fields (limited rows, stable cross-section) + pv1 fields (daily)
-    fund_fields = ["revenue", "debt", "operating_income", "ebitda", "cap", "enterprise_value"]
-    pv1_fields = ["returns", "volume", "adv20", "high", "low", "open"]
+    # Use fund fields + pv1 fields with time-series wrapping
+    fund_fields = ["revenue", "debt", "operating_income", "cap", "enterprise_value", "equity"]
+    pv1_fields = ["returns", "volume", "adv20", "high", "low", "open", "close", "vwap"]
+
     combos = [
-        # (field_a, field_b, operator, weight, name_suffix)
-        # Addition: both signals should move in similar direction
-        ("revenue", "cap", "+", 1.0, "rev_cap_add"),
-        ("debt", "equity", "+", 1.0, "debt_eq_add"),
-        ("operating_income", "cap", "+", 1.0, "oi_cap_add"),
-        ("revenue", "enterprise_value", "+", 1.0, "rev_ev_add"),
-        # Subtraction with weight: one signal minus the other
-        ("revenue", "cap", "-", 1.0, "rev_cap_sub"),
-        ("debt", "equity", "-", 1.0, "debt_eq_sub"),
-        ("revenue", "enterprise_value", "-", 1.0, "rev_ev_sub"),
-        ("operating_income", "cap", "-", 1.0, "oi_cap_sub"),
-        # Cross-domain mix: fundamental + pv1 (proven by LLnNAYv1)
-        ("debt", "returns", "-", 2.0, "debt_ret_sub2"),
-        ("revenue", "returns", "-", 1.0, "rev_ret_sub"),
-        ("cap", "returns", "+", 1.0, "cap_ret_add"),
-        ("operating_income", "volume", "-", 1.0, "oi_vol_sub"),
-        # Double addition: three-fundamental push
-        ("revenue", "debt", "+", 1.0, "rev_debt_add"),
-        ("operating_income", "debt", "+", 1.0, "oi_debt_add"),
+        # ── Pattern 1: ts_delta wrapper on pv1 side (lowest operator count) ──
+        # rank(fund_A) - W*rank(ts_delta(pv1, N))
+        ("debt", "ts_delta(close,5)", "subtract", 1.0, "debt_dcl5"),
+        ("revenue", "ts_delta(close,5)", "subtract", 1.0, "rev_dcl5"),
+        ("cap", "ts_delta(close,5)", "subtract", 1.0, "cap_dcl5"),
+        ("enterprise_value", "ts_delta(close,5)", "subtract", 1.0, "ev_dcl5"),
+        ("operating_income", "ts_delta(close,5)", "subtract", 1.0, "oi_dcl5"),
+        ("equity", "ts_delta(close,5)", "subtract", 1.0, "eq_dcl5"),
+
+        ("debt", "ts_delta(high,5)", "subtract", 1.0, "debt_dhi5"),
+        ("revenue", "ts_delta(high,5)", "subtract", 1.0, "rev_dhi5"),
+
+        # ── Pattern 2: ts_mean momentum on pv1 side ──
+        # rank(fund_A) - W*rank(ts_mean(pv1, N))
+        ("debt", "ts_mean(returns,5)", "subtract", 1.0, "debt_mret5"),
+        ("revenue", "ts_mean(returns,5)", "subtract", 1.0, "rev_mret5"),
+        ("cap", "ts_mean(returns,5)", "subtract", 1.0, "cap_mret5"),
+        ("equity", "ts_mean(returns,5)", "subtract", 1.0, "eq_mret5"),
+        ("enterprise_value", "ts_mean(returns,5)", "subtract", 1.0, "ev_mret5"),
+        ("operating_income", "ts_mean(volume,10)", "subtract", 1.0, "oi_mvol10"),
+
+        # ── Pattern 3: ts_rank wrapping on fundamental side ──
+        # rank(ts_rank(fund, 250)) +/- W*rank(pv1)
+        ("ts_rank(debt,250)", "returns", "add", 1.0, "tsr_debt_ret"),
+        ("ts_rank(revenue,250)", "returns", "add", 1.0, "tsr_rev_ret"),
+        ("ts_rank(cap,250)", "returns", "add", 1.0, "tsr_cap_ret"),
+        ("ts_rank(equity,250)", "returns", "subtract", 1.0, "tsr_eq_ret_sub"),
+        ("ts_rank(enterprise_value,250)", "returns", "subtract", 1.0, "tsr_ev_ret_sub"),
+        ("ts_rank(operating_income,250)", "volume", "subtract", 1.0, "tsr_oi_vol"),
+
+        # ── Pattern 4: cross-domain (fund + native-ts pv1, proven working) ──
+        # rank(debt) - 2*rank(returns) ← LLnNAYv1 proven
+        ("debt", "returns", "subtract", 2.0, "debt_ret_sub2"),
+        ("revenue", "returns", "subtract", 1.0, "rev_ret_sub"),
+        ("cap", "returns", "add", 1.0, "cap_ret_add"),
+        ("enterprise_value", "returns", "subtract", 1.0, "ev_ret_sub"),
+        ("equity", "returns", "subtract", 1.0, "eq_ret_sub"),
+        ("operating_income", "returns", "subtract", 1.0, "oi_ret_sub"),
     ]
+
     seen = set()
-    for f_a, f_b, op, w, suffix in combos:
-        if op == "+":
-            expr = f"rank({f_a})+{w}*rank({f_b})"
+    for left, right, op, w, suffix in combos:
+        if op == "add":
+            expr = f"rank({left})+{w}*rank({right})"
         else:
-            expr = f"rank({f_a})-{w}*rank({f_b})"
+            expr = f"rank({left})-{w}*rank({right})"
         if expr in seen or expr in active_exprs:
             continue
         seen.add(expr)
@@ -932,7 +957,7 @@ def _generate_direct_rank_candidates(ortho: dict, active_exprs: list) -> list:
         name = f"DR_{suffix}"[:40]
         candidates.append({
             "name": name, "expr": expr,
-            "orthogonality_score": score,  # P2: no skeleton boost here — _sort_key handles it
+            "orthogonality_score": score,
             "skeleton": SKELETON_DIRECT_RANK,
             "weight": w,
         })
@@ -1120,10 +1145,9 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     # These fill structural gaps in the current portfolio (see gap_fill docs above)
     # Each uses only proven field pairs, avoiding S=None (ebitda/cash/sales)
 
-    pure_add = _generate_pure_add_candidates(ortho, active_exprs)
-    if pure_add:
-        log(f"  ➕ Adding {len(pure_add)} PURE_ADD candidates")
-        all_candidates.extend(pure_add)
+    # PURE_ADD removed: rank(A/B)+rank(C/D) has zero time-series component,
+    # causing WQ to return S=None for every expression (cross-section only → no trading signal).
+    # Use THREE_TERM (which adds a ts_* term) or DIRECT_RANK with ts_* operators instead.
 
     pure_mult = _generate_pure_mult_candidates(ortho, active_exprs)
     if pure_mult:
@@ -1132,7 +1156,7 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
 
     direct_rank = _generate_direct_rank_candidates(ortho, active_exprs)
     if direct_rank:
-        log(f"  📊 Adding {len(direct_rank)} DIRECT_RANK candidates (no-ratio, no-ts)")
+        log(f"  📊 Adding {len(direct_rank)} DIRECT_RANK candidates (all with ts component)")
         all_candidates.extend(direct_rank)
 
     three_term = _generate_three_term_candidates(ortho, active_exprs)
@@ -1171,7 +1195,7 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     # Field pool is saturated (15 ACTIVE). MULT alone can't break through.
     # Rotate through skeleton tiers each batch:
     #   Phase 0: MULT (with exhaustion detection)
-    #   Phase 1: DIRECT_RANK + PURE_ADD (no ratio pair, lowest S=None risk)
+    #   Phase 1: DIRECT_RANK with ts_* (low operator count, all have ts component)
     #   Phase 2: THREE_TERM + IND_NEUT + SUB + PURE_MULT + RATIO_LAG
     # When stuck_batches increments (all S=None), rotation advances.
     import re
@@ -1241,16 +1265,16 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
             result.append(c)
         log(f"  🟢 Phase 0: trying {len(result)} MULT candidates (template-deduped)")
     
-    # ── Phase 1: no-ratio skeletons (DIRECT_RANK + PURE_ADD) ──
+    # ── Phase 1: no-ratio skeletons (DIRECT_RANK with ts_*) ──
     if rotation_phase == 1 or (rotation_phase == 0 and mult_exhausted):
-        tier1 = sorted_group(SKELETON_DIRECT_RANK) + sorted_group(SKELETON_PURE_ADD)
+        tier1 = sorted_group(SKELETON_DIRECT_RANK)
         tier1.sort(key=_sort_key)
         result.extend(tier1[:n])
         if len(result) < n:
             tier2 = sorted_group(SKELETON_THREE_TERM) + sorted_group(SKELETON_PURE_MULT)
             tier2.sort(key=_sort_key)
             result.extend(tier2[:n - len(result)])
-        log(f"  🔵 Phase 1: trying {len(result)} no-ratio candidates")
+        log(f"  🔵 Phase 1: trying {len(result)} DIRECT_RANK candidates (all with ts component)")
     
     # ── Phase 2: mixed exploration skeletons ──
     if rotation_phase == 2 or (rotation_phase == 0 and mult_exhausted and not result):
