@@ -458,6 +458,8 @@ def _build_ratio_pool(ortho: dict, skip_zero_occupancy: bool = False) -> list:
     for f, c in usage_sorted:
         if c > 1 or f == "close":
             continue
+        if skip_zero_occupancy and f in zero_usage_fields:
+            continue  # Skip zero-usage fields in second pass too
         for den in ["cap", "enterprise_value", "equity"]:
             if den == f:
                 continue
@@ -634,37 +636,37 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     """
     ratio_pool = _build_ratio_pool(ortho, skip_zero_occupancy=(stuck_batches >= 2))
     
-    if not ratio_pool:
-        log("  ⚠️ No ratio pairs available for generation!")
-        return []
-    
     mult_count = ortho.get("multiplication_count", 0)
     sub_count = ortho.get("subtraction_count", 0)
     
     log(f"  🏗 AST structure balance: {mult_count} mult / {sub_count} sub in active")
     
-    # Decision: which skeleton to generate?
-    use_mult = mult_count < 2  # Prefer multiplication if < 2 exist
-    use_sub = not use_mult and sub_count < 6  # Fall back to subtraction
-    
     all_candidates = []
     
-    if use_mult:
-        log("  🟢 Generating MULTIPLICATION candidates (skeleton under-utilized)")
-        all_candidates = _generate_mult_candidates(ratio_pool, ortho, active_exprs)
+    if ratio_pool:
+        # Decision: which skeleton to generate?
+        use_mult = mult_count < 2  # Prefer multiplication if < 2 exist
+        use_sub = not use_mult and sub_count < 6  # Fall back to subtraction
+        
+        if use_mult:
+            log("  🟢 Generating MULTIPLICATION candidates (skeleton under-utilized)")
+            all_candidates = _generate_mult_candidates(ratio_pool, ortho, active_exprs)
+        
+        if use_sub:
+            log("  🔵 Generating SUBTRACTION candidates (multiplication saturated)")
+            sub_candidates = _generate_sub_candidates(ratio_pool, ortho, active_exprs)
+            all_candidates.extend(sub_candidates)
+    else:
+        log("  ⚠️ No ratio pairs available — falling back to fundamental growth templates")
     
-    if use_sub:
-        log("  🔵 Generating SUBTRACTION candidates (multiplication saturated)")
-        sub_candidates = _generate_sub_candidates(ratio_pool, ortho, active_exprs)
-        # Also try growth-based subtraction (fundamental + daily signal addition)
-        # This pattern avoids the coverage mismatch of rank(fundamental) - rank(ts_delta(daily))
-        growth_sub = _generate_fund_growth_sub_candidates(ortho, active_exprs)
-        log(f"  📈 Adding {len(growth_sub)} fundamental growth subtraction candidates")
-        all_candidates.extend(sub_candidates)
-        all_candidates.extend(growth_sub)
+    # Always add growth-based subtraction (fundamental + daily signal addition)
+    # This pattern avoids coverage mismatch and uses only non-zero-usage fields
+    growth_sub = _generate_fund_growth_sub_candidates(ortho, active_exprs)
+    log(f"  📈 Adding {len(growth_sub)} fundamental growth subtraction candidates")
+    all_candidates.extend(growth_sub)
     
     if not all_candidates:
-        log("  ⚠️ No candidates generated!")
+        log("  ⚠️ No candidates generated!", "error")
         return []
     
     # Deduplicate by expression
