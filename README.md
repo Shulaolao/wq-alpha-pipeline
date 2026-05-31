@@ -62,12 +62,11 @@ graph TD
     subgraph S4["4️⃣ Full IS"]
         F1[_run_full_sim<br>全量 5Y 回测]:::action --> F2[adaptive_poll<br>15s → 60s → 120s<br>卡300s放弃]:::action
         F2 --> F3{IS status?}:::decision
-        F3 -->|PASS<br>S≥1.25 + 检查| F4[✅ 优化策略<br>S≥2.0直接提交<br>&lt;1.3进调参]:::action
-        F3 -->|TUNE| F5[调参重试<br>网格搜权重 + 5种动量]:::action
-        F3 -->|FAIL| F6[救火调参<br>换动量 + 换权重<br>5变体上限]:::action
-        F4 & F5 & F6 --> F7{成功?}:::decision
-        F7 -->|✅ 是| F8[进入 SC]:::action
-        F7 -->|❌ 否| F9[✖ 候选丢弃<br>飞书通知 ⚠️]:::action
+        F3 -->|PASS<br>fail≤1 pass≥6| F4[✅ 优化策略<br>S≥2.0直接提交<br>&lt;1.3进调参]:::action
+        F3 -->|TUNE - S强<br>S≥1.25 fail≤2| F5[调参重试<br>网格搜权重 + 5种动量]:::action
+        F3 -->|TUNE - F补偿<br>S≥1.0 F≥0.8 fail≤2| F5
+        F3 -->|FAIL| F9[✖ 候选丢弃<br>飞书通知 ⚠️]:::action
+        F4 & F5 --> F8[进入 SC<br>飞书通知 ✅]:::action
     end
 
     F8 --> S5
@@ -159,11 +158,12 @@ open http://localhost:8765
 
 ```
 wq-alpha-pipeline/
-├── wq_workflow_v2.py               # 主工作流 (2278 行)
+├── wq_workflow_v2.py               # 主工作流 (2311 行)
 │   ├── P1(2026-05-30): 修复 S=None 被误判 IS PASS → 死对候选不再浪费 SC slot
 │   ├── P2(2026-05-30): 骨架优先级统一在 _sort_key 管理，移除生成器预加成失真
 │   ├── P3(2026-05-30): stuck 模式旁路多样性约束，DIRECT_RANK 优先选入
-│   └── P4(2026-05-30): 骨架旋转系统 — MULT 枯竭检测 + 3 Phase 轮换
+│   ├── P4(2026-05-30): 骨架旋转系统 — MULT 枯竭检测 + 3 Phase 轮换
+│   └── P5(2026-05-30): fitness 补偿软通过 — S≥1.0+F≥0.8 也能进调参
 ├── scripts/
 │   └── wq_pipeline.py              # 旧版三阶段流水线（已废弃）
 ├── config/
@@ -218,7 +218,7 @@ pv1:          close, volume, adv20, returns, vwap, open, high, low
 
 ### 飞书 Bot 推送
 
-- 事件：IS/SC 通过、新 ACTIVE、调参耗尽、流水线错误
+- 事件：IS/SC 通过、调参成功、新 ACTIVE、调参耗尽、流水线错误
 - 零 LLM Token 成本（纯 Bot API）
 - 30s 同事件去重
 - 通知事件在流程图中以虚线标注

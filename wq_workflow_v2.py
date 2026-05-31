@@ -25,6 +25,16 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
+# ═══ Auto-load .env from home directory ═══
+_env_path = Path.home() / ".hermes" / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 import requests, urllib3
 urllib3.disable_warnings()
 _TLS_CTX = ssl.create_default_context()
@@ -44,6 +54,11 @@ HOME = Path.home()
 STATE_FILE = HOME / ".wq_workflow_v2.json"
 LOG_FILE = HOME / ".wq_workflow_v2.log"
 TARGET_ACTIVE = 20
+
+# ── Token auto-refresh ──
+# WQ token TTL = 14400s (4h). Refresh at 3h to keep 1h margin.
+_TOKEN_REFRESH_INTERVAL = 3 * 3600  # 3 hours
+_last_auth_time = 0  # set by fresh_session()
 
 # ── Default settings ──
 DEFAULT_SETTINGS = {
@@ -245,8 +260,9 @@ def ensure_wq_connectivity(s: requests.Session) -> bool:
 
 # ═══ Session ═══════════════════════════════════════
 def fresh_session() -> requests.Session:
+    global _last_auth_time
     s = requests.Session()
-    s.mount("https://", _TLSAdapter())
+    s.mount("https", _TLSAdapter())
     s.verify = False
     s.trust_env = False
     # Use Clash proxy (port 7897) — required from China network
@@ -256,6 +272,7 @@ def fresh_session() -> requests.Session:
         try:
             r = s.post(f"{API}/authentication", auth=(EMAIL, PASS), timeout=60)
             if r.status_code == 201:
+                _last_auth_time = time.time()
                 log("🔐 Auth OK")
                 return s
             raise RuntimeError(f"Auth failed: {r.status_code} {r.text[:200]}")
@@ -265,6 +282,18 @@ def fresh_session() -> requests.Session:
             log(f"⚠️ Auth attempt {attempt+1} failed: {str(e)[:60]}, retrying...")
             time.sleep(3)
     raise RuntimeError("Auth: unexpected")
+
+
+def _ensure_valid_session(session: requests.Session) -> requests.Session:
+    """Auto-refresh session token if >3h old or if 401 detected. Returns (session, was_refreshed)."""
+    global _last_auth_time
+    now = time.time()
+    if now - _last_auth_time > _TOKEN_REFRESH_INTERVAL:
+        log(f"🔄 Token expired ({now - _last_auth_time:.0f}s since auth), refreshing...")
+        new_s = fresh_session()
+        _last_auth_time = now  # fresh_session() sets it, but be safe
+        return new_s
+    return session
 
 # ═══ ORTHOGONALITY ANALYSIS ═══════════════════════
 def fetch_active_alphas(s: requests.Session) -> list:
@@ -1316,6 +1345,7 @@ def adaptive_poll(session, url: str, poll_name: str,
     last_slowdown = start
     last_progress = 0
     stuck_since = None
+    refresh_tried = False  # prevent infinite loop on auth failure
     
     log(f"⏳ Polling {poll_name} (max {max_wait}s, start every {initial_interval}s)")
     
@@ -1323,6 +1353,14 @@ def adaptive_poll(session, url: str, poll_name: str,
         elapsed = time.time() - start
         try:
             r = session.get(url, timeout=60)
+            if r.status_code == 401 and not refresh_tried:
+                log(f"⚠️ 401 on {poll_name} ({elapsed:.0f}s), refreshing token...", "warn")
+                new_s = fresh_session()
+                _last_auth_time = time.time()
+                session = new_s  # reuse the local var (polls same session obj)
+                refresh_tried = True
+                time.sleep(2)  # let proxy settle
+                continue
             if r.status_code == 200:
                 data = r.json()
                 result = success_condition(data)
@@ -1664,6 +1702,15 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
         except Exception as e:
             log(f"⏩ Quick test POST failed: {e}", "error")
             return True  # pass through on error, let full sim decide
+        if r.status_code == 401:
+            log("⚠️ 401 on quick test POST, refreshing session...", "warn")
+            self.s = fresh_session()
+            _last_auth_time = time.time()
+            try:
+                r = self.s.post(f"{API}/simulations", json=payload, timeout=60)
+            except Exception as e:
+                log(f"⏩ Quick test retry POST failed: {e}", "error")
+                return True
         if r.status_code != 201:
             log(f"⏩ Quick test: HTTP {r.status_code}", "error")
             return True
@@ -1709,6 +1756,17 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             log(f"❌ POST sim failed: {e}", "error")
             cand["error"] = str(e)
             return False
+
+        # Auto-refresh on 401
+        if r.status_code == 401:
+            log("⚠️ 401 on sim POST, refreshing session...", "warn")
+            self.s = fresh_session()
+            _last_auth_time = time.time()
+            try:
+                r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
+            except Exception as e:
+                log(f"❌ Sim retry POST failed: {e}", "error")
+                return False
 
         if r.status_code == 429:
             retry = int(r.headers.get("Retry-After", 900))
@@ -1814,6 +1872,17 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             log(f"❌ SC submit: {e}", "error")
             return False
         
+        # Auto-refresh on 401
+        if r.status_code == 401:
+            log("⚠️ 401 on SC submit, refreshing session...", "warn")
+            self.s = fresh_session()
+            _last_auth_time = time.time()
+            try:
+                r = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
+            except Exception as e:
+                log(f"❌ SC submit retry failed: {e}", "error")
+                return False
+        
         if r.status_code in (200, 201, 202):
             log(f"   SC submitted (HTTP {r.status_code})")
         elif r.status_code == 403:
@@ -1854,6 +1923,11 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             # Try 403 probe as fallback
             try:
                 r3 = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
+                if r3.status_code == 401:
+                    log("⚠️ 401 on SC probe, refreshing session...", "warn")
+                    self.s = fresh_session()
+                    _last_auth_time = time.time()
+                    r3 = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
                 if r3.status_code == 403:
                     body = r3.json()
                     checks = body.get("is", {}).get("checks", []) if isinstance(body.get("is"), dict) else []
@@ -1889,6 +1963,17 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
         except Exception as e:
             log(f"❌ Submit failed: {e}", "error")
             return
+        
+        # Auto-refresh on 401
+        if r.status_code == 401:
+            log("⚠️ 401 on submit, refreshing session...", "warn")
+            self.s = fresh_session()
+            _last_auth_time = time.time()
+            try:
+                r = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
+            except Exception as e:
+                log(f"❌ Submit retry failed: {e}", "error")
+                return
         
         if r.status_code in (200, 201, 202):
             log(f"✅ Submitted! status={r.status_code}")
@@ -2155,6 +2240,17 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             except Exception as e:
                 log(f"    ❌ POST: {e}")
                 continue
+            
+            # Auto-refresh on 401
+            if r.status_code == 401:
+                log("    ⚠️ 401 on tune sim POST, refreshing session...", "warn")
+                self.s = fresh_session()
+                _last_auth_time = time.time()
+                try:
+                    r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
+                except Exception as e:
+                    log(f"    ❌ Tune sim retry POST failed: {e}", "error")
+                    continue
             
             if r.status_code == 429:
                 retry = int(r.headers.get("Retry-After", 60))
