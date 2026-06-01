@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-WQ Dashboard Server v2 — Full Data API
-Reads ~/.wq_workflow_v2.json, ~/.wq_workflow_v2.log, ~/.wq_batch_state.json
-Exposes all pipeline data: active alphas, batch details, orthogonality, history
+WQ Dashboard Server v3 — SQLite-backed
+========================================
+优先读 SQLite 数据库，兼容旧 JSON 文件。
+Exposes all pipeline data: active alphas, batch details, orthogonality, history, cumulative stats
 """
-import json, os, re, time
+import json, os, re, time, sys
 from pathlib import Path
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
+
+# Add scripts dir for wq_db import
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import wq_db
 
 app = Flask(__name__)
 
@@ -22,7 +27,7 @@ def add_cors(response):
     return response
 
 HOME = Path.home()
-STATE_FILE = HOME / ".wq_workflow_v2.json"
+STATE_FILE = HOME / ".wq_workflow_v2.json"  # fallback
 LOG_FILE = HOME / ".wq_workflow_v2.log"
 BATCH_FILE = HOME / ".wq_batch_state.json"
 STDERR_FILE = HOME / ".wq_workflow_v2_stderr.log"
@@ -62,8 +67,8 @@ def extract_fields(expr):
     """Extract data fields from a WQ alpha expression."""
     SKIP = frozenset({
         'rank','ts_mean','ts_delta','ts_av_diff','ts_min','ts_max',
-        'ts_sum','ts_std','ts_rank','ts_argmax','ts_argmin','ts_argmax',
-        'ts_argmin','ts_corr','ts_covariance','ts_zscore','ts_decay_linear',
+        'ts_sum','ts_std','ts_rank','ts_argmax','ts_argmin','ts_corr',
+        'ts_covariance','ts_zscore','ts_decay_linear',
         'group_rank','scale','neutralize','abs','signed_power',
         'log','sqrt','min','max','sum','mean','std','covariance',
         'correlation','sign','clip','winsorize','ind_neutral',
@@ -74,14 +79,6 @@ def extract_fields(expr):
         if tok not in SKIP:
             fields.add(tok)
     return sorted(fields)
-
-def parse_log_timestamp(ts_str):
-    try:
-        dt = datetime.strptime(ts_str.strip(), "%m-%d %H:%M:%S")
-        dt = dt.replace(year=datetime.now().year)
-        return dt.isoformat()
-    except ValueError:
-        return ts_str
 
 def compute_duration(started_at):
     if not started_at:
@@ -102,13 +99,21 @@ def compute_duration(started_at):
 
 @app.route("/api/status")
 def api_status():
-    state = read_json_safe(STATE_FILE)
+    # Read workflow state from SQLite
+    full_state = wq_db.load_workflow_state("workflow")
+    
+    # Fallback to JSON if SQLite has no data
+    if not full_state:
+        full_state = read_json_safe(STATE_FILE)
+    
     batch_state = read_json_safe(BATCH_FILE)
     log_entries = read_lines_safe(LOG_FILE, 100)
-
+    
+    # Cumulative stats from SQLite
+    cumulative = wq_db.get_cumulative_stats()
+    
     # ── Field usage ──
-    fields_used = state.get("fields_used", {})
-    total_fields = max(len(fields_used), 1)
+    fields_used = full_state.get("fields_used", {})
     max_count = max(fields_used.values()) if fields_used else 1
     field_chart = [
         {"field": k, "count": v, "pct": round(v / max_count * 100, 1)}
@@ -116,8 +121,8 @@ def api_status():
     ] if fields_used else []
 
     # ── Current batch info ──
-    batch = state.get("current_batch", [])
-    batch_idx = state.get("batch_idx", 0)
+    batch = full_state.get("current_batch", [])
+    batch_idx = full_state.get("batch_idx", 0)
     current = batch[batch_idx] if batch and batch_idx < len(batch) else None
 
     # ── SIM progress from log ──
@@ -134,7 +139,7 @@ def api_status():
         current["sim_progress"] = sim_progress
 
     # ── Session timing ──
-    started_at = state.get("started_at", "")
+    started_at = full_state.get("started_at", "")
     duration = compute_duration(started_at)
 
     # ── Last activity from latest log entry ──
@@ -145,14 +150,14 @@ def api_status():
 
     return jsonify({
         # Pipeline basics
-        "status": state.get("status", "idle"),
-        "phase": state.get("phase", "init"),
-        "active_count": state.get("active_count", 0),
+        "status": full_state.get("status", "idle"),
+        "phase": full_state.get("phase", "init"),
+        "active_count": full_state.get("active_count", 0),
         "target": 20,
 
         # Timing
         "started_at": started_at,
-        "last_updated": state.get("last_updated", ""),
+        "last_updated": full_state.get("last_updated", ""),
         "duration": duration,
         "last_activity": last_activity,
 
@@ -164,30 +169,35 @@ def api_status():
         "batch_index": batch_idx + 1 if batch else 0,
         "batch_id": batch_state.get("batch_id", ""),
 
-        # Run totals
-        "candidates_generated": state.get("candidates_generated", 0),
-        "candidates_passed_is": state.get("candidates_passed_is", 0),
-        "candidates_passed_sc": state.get("candidates_passed_sc", 0),
-        "candidates_submitted": state.get("candidates_submitted", 0),
-        "iterations": state.get("iterations", 0),
+        # Run totals (from state)
+        "candidates_generated": full_state.get("candidates_generated", 0),
+        "candidates_passed_is": full_state.get("candidates_passed_is", 0),
+        "candidates_passed_sc": full_state.get("candidates_passed_sc", 0),
+        "candidates_submitted": full_state.get("candidates_submitted", 0),
+        "iterations": full_state.get("iterations", 0),
+
+        # Cumulative stats (from SQLite)
+        "cumulative_stats": cumulative,
 
         # Errors
-        "errors": state.get("errors", [])[-5:],
+        "errors": full_state.get("errors", [])[-5:],
 
         # Charts & logs
         "field_chart": field_chart,
         "log": log_entries,
 
-        # Full actives (all, not just 5)
-        "actives": state.get("actives_data", []),
+        # Full actives
+        "actives": full_state.get("actives_data", []),
     })
 
 # ─── All Active Alphas with Details ────────────────────────────────────
 
 @app.route("/api/actives")
 def api_actives():
-    state = read_json_safe(STATE_FILE)
-    actives = state.get("actives_data", [])
+    full_state = wq_db.load_workflow_state("workflow")
+    if not full_state:
+        full_state = read_json_safe(STATE_FILE)
+    actives = full_state.get("actives_data", [])
 
     enriched = []
     for a in actives:
@@ -211,11 +221,13 @@ def api_actives():
 
 @app.route("/api/batch")
 def api_batch():
-    state = read_json_safe(STATE_FILE)
+    full_state = wq_db.load_workflow_state("workflow")
+    if not full_state:
+        full_state = read_json_safe(STATE_FILE)
     batch_state = read_json_safe(BATCH_FILE)
 
-    batch = state.get("current_batch", [])
-    batch_idx = state.get("batch_idx", 0)
+    batch = full_state.get("current_batch", [])
+    batch_idx = full_state.get("batch_idx", 0)
 
     # Enrich each candidate with field analysis
     enriched = []
@@ -257,8 +269,10 @@ def api_batch():
 
 @app.route("/api/orthogonality")
 def api_orthogonality():
-    state = read_json_safe(STATE_FILE)
-    actives = state.get("actives_data", [])
+    full_state = wq_db.load_workflow_state("workflow")
+    if not full_state:
+        full_state = read_json_safe(STATE_FILE)
+    actives = full_state.get("actives_data", [])
 
     parsed = []
     for a in actives:
@@ -300,10 +314,19 @@ def api_orthogonality():
         "edges": edges,
     })
 
-# ─── History ───────────────────────────────────────────────────────────
+# ─── History (from SQLite) ───────────────────────────────────────────
 
 @app.route("/api/history")
 def api_history():
+    # Primary: read from SQLite
+    try:
+        result = wq_db.get_all_alpha_history(limit=200)
+        if result["total"] > 0:
+            return jsonify(result)
+    except Exception as e:
+        print(f"SQLite history error: {e}", flush=True)
+    
+    # Fallback: parse log file (legacy)
     log_text = ""
     try:
         if LOG_FILE.exists():
@@ -334,7 +357,15 @@ def api_history():
         if not match:
             continue
         ts_str, level, message = match.groups()
-        iso_ts = parse_log_timestamp(ts_str)
+        
+        def parse_ts(ts):
+            try:
+                dt = datetime.strptime(ts.strip(), "%m-%d %H:%M:%S")
+                dt = dt.replace(year=datetime.now().year)
+                return dt.isoformat()
+            except ValueError:
+                return ts
+        iso_ts = parse_ts(ts_str)
 
         for pattern, etype, extractor in patterns:
             m = re.search(pattern, message, re.IGNORECASE)
@@ -354,16 +385,89 @@ def api_history():
         "events": history,
     })
 
-# ─── Log ───────────────────────────────────────────────────────────────
+# ─── Alpha Events Timeline (new endpoint) ────────────────────────────
+
+@app.route("/api/events")
+def api_events():
+    """Get alpha lifecycle events from SQLite."""
+    limit = request.args.get("limit", 100, type=int)
+    try:
+        events = wq_db.get_recent_alpha_events(limit=limit)
+        return jsonify({
+            "total": limit,
+            "events": events,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── Cumulative Stats Endpoint ───────────────────────────────────────
+
+@app.route("/api/cumulative")
+def api_cumulative():
+    """Get cumulative counters from SQLite."""
+    try:
+        stats = wq_db.get_cumulative_stats()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── Log (from SQLite, fallback to file) ───────────────────────────────
 
 @app.route("/api/log")
 def api_log():
     n = request.args.get("lines", 100, type=int)
+    try:
+        # Try SQLite first
+        log_entries = wq_db.get_workflow_logs(limit=n)
+        # Convert to same format as file-based
+        formatted = []
+        for entry in log_entries:
+            formatted.append({
+                "time": entry["timestamp"],
+                "level": entry["level"],
+                "msg": entry["message"],
+                "alpha_name": entry.get("alpha_name"),
+            })
+        return jsonify({
+            "total": len(formatted),
+            "returned": len(formatted),
+            "entries": formatted,
+            "source": "sqlite",
+        })
+    except Exception as e:
+        print(f"SQLite log error, falling back to file: {e}", flush=True)
+    
+    # Fallback: file
     return jsonify({
-        "total": -1,  # unknown
+        "total": -1,
         "returned": min(n, 500),
         "entries": read_lines_safe(LOG_FILE, min(n, 500)),
+        "source": "file",
     })
+
+# ─── Error Logs ──────────────────────────────────────────────────────
+
+@app.route("/api/logs/errors")
+def api_errors():
+    try:
+        errors = wq_db.get_error_logs(limit=100)
+        return jsonify({
+            "total": len(errors),
+            "entries": errors,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/logs/warnings")
+def api_warnings():
+    try:
+        warns = wq_db.get_warn_logs(limit=100)
+        return jsonify({
+            "total": len(warns),
+            "entries": warns,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ─── Serve Legacy HTML (keep for compat) ───────────────────────────────
 
@@ -378,8 +482,8 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8767))
-    print(f"🚀 WQ Dashboard v2 starting on http://0.0.0.0:{port}")
-    print(f"   State: {STATE_FILE}")
-    print(f"   Batch: {BATCH_FILE}")
-    print(f"   Log:   {LOG_FILE}")
+    print(f"🚀 WQ Dashboard v3 starting on http://0.0.0.0:{port}")
+    print(f"   DB:      {wq_db.DB_PATH}")
+    print(f"   State:   {STATE_FILE} (fallback)")
+    print(f"   Log:     {LOG_FILE}")
     app.run(host="0.0.0.0", port=port, debug=False)

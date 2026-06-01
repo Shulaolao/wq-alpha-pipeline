@@ -232,12 +232,23 @@ pv1:          close, volume, adv20, returns, vwap, open, high, low
 
 ## 状态文件
 
-```json
-~/.wq_workflow_v2.json    # 实时流水线状态（ACTIVE 列表、阶段、候选、统计）
+```
+~/.wq_workflow_v2.db      # SQLite 数据库（状态 + 事件 + 日志 + 统计）
+~/.wq_workflow_v2.json    # 旧格式，首次启动自动迁移至 .db
 ~/.wq_workflow_v2.log     # 结构化日志（时间戳|级别|消息）
 ~/.wq_workflow_v2_stdout.log   # launchd stdout
 ~/.wq_workflow_v2_stderr.log   # launchd stderr
 ```
+
+### SQLite 数据库结构
+
+| 表名 | 用途 |
+|---|---|
+| `workflow_state` | 实时工作流状态（替代 state.json） |
+| `alpha_events` | 每个 alpha 全生命周期事件（生成/IS pass/SC pass/提交/失败/优化） |
+| `alpha_stats` | 每个 alpha 的最新统计快照 |
+| `cumulative_stats` | 全局累计计数器（total_generated / total_is_pass / total_sc_pass / total_submitted / total_failed） |
+| `workflow_logs` | 所有 alpha 相关的日志行（INFO / WARN / ERROR） |
 
 ---
 
