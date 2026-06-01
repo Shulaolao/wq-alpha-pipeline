@@ -105,6 +105,51 @@ ALL_WQ_OPERATORS = [
 FIELD_PATTERN = re.compile(r'\b(' + '|'.join(re.escape(f) for f in ALL_WQ_FIELDS) + r')\b')
 RATIO_PATTERN = re.compile(r'\b(' + '|'.join(re.escape(f) for f in ALL_WQ_FIELDS) + r')/(' + '|'.join(re.escape(f) for f in ALL_WQ_FIELDS) + r')')
 
+# Regex to extract ratio pattern from ANY ratio, including nested ones like
+# rank(ts_delta(close,5)/enterprise_value). Captures raw text on each side of slash.
+RATIO_PATTERN_STRICT = re.compile(r'rank\(\s*([^)]+)\s*/\s*([^)]+)\s*\)')
+
+# ── Ratio pattern families for SELF_CORRELATION modeling ──
+# WQ SC considers signals from the same "pattern family" as correlated,
+# even if individual fields differ. e.g. rev/ev, rev/cap, rev/equity
+# all belong to the "revenue-as-numerator" family.
+_NUM_TO_FAMILY = {}
+for _f in ["revenue", "debt", "operating_income", "cap", "enterprise_value", "equity", "ebitda", "sales", "cash"]:
+    _NUM_TO_FAMILY[_f] = _f
+
+DENOM_FAMILY_MAP = {
+    "enterprise_value": "ev",
+    "cap": "cap",
+    "equity": "equity",
+    "sales": "sales",
+    "revenue": "revenue",
+    "debt": "debt",
+    "operating_income": "oi",
+    "ebitda": "ebitda",
+    "cash": "cash",
+}
+
+def _extract_ratio_patterns(expr: str) -> list:
+    """Extract ratio patterns from expression as (numerator_family, denominator_family) tuples.
+
+    For nested ratios like rank(ts_delta(close,5)/enterprise_value),
+    extracts the effective field ratio family (e.g. 'close' -> 'ev').
+    For simple ratios like rank(debt/equity), extracts ('debt', 'equity').
+    """
+    patterns = []
+    for m in RATIO_PATTERN_STRICT.finditer(expr):
+        num_raw = m.group(1).strip()
+        den_raw = m.group(2).strip()
+        num_fields = FIELD_PATTERN.findall(num_raw)
+        den_fields = FIELD_PATTERN.findall(den_raw)
+        if num_fields and den_fields:
+            num_field = num_fields[-1]
+            den_field = den_fields[-1]
+            num_family = _NUM_TO_FAMILY.get(num_field, num_field)
+            den_family = DENOM_FAMILY_MAP.get(den_field, den_field)
+            patterns.append((num_family, den_family))
+    return patterns
+
 # ── Field time-frequency compatibility groups ──
 # Mixing daily-updated (pv1) with quarterly-updated (fundamental6) fields in ratio pairs
 # causes NA coverage misalignment → S=None in WQ engine
@@ -357,7 +402,8 @@ def analyze_orthogonality(alphas: list) -> dict:
     fields_used = {f: 0 for f in ALL_WQ_FIELDS}
     structures = []
     field_pairs_used = set()
-    
+    ratio_pattern_freq = {}  # {(num_family, den_family): count_of_actives}
+
     for a in alphas:
         expr = a["expr"]
         # Extract all fields
@@ -409,6 +455,11 @@ def analyze_orthogonality(alphas: list) -> dict:
         for m in RATIO_PATTERN.finditer(expr):
             pair = frozenset([m.group(1), m.group(2)])
             field_pairs_used.add(pair)
+        
+        # ── NEW: Extract ratio pattern families for SELF_CORRELATION modeling ──
+        for (num_fam, den_fam) in _extract_ratio_patterns(expr):
+            key = (num_fam, den_fam)
+            ratio_pattern_freq[key] = ratio_pattern_freq.get(key, 0) + 1
     
     # Sort fields by usage (most used first)
     sorted_fields = sorted(fields_used.items(), key=lambda x: -x[1])
@@ -430,6 +481,7 @@ def analyze_orthogonality(alphas: list) -> dict:
         "fields_used": fields_used,
         "structures": structures,
         "field_pairs_used": field_pairs_used,
+        "ratio_pattern_freq": ratio_pattern_freq,
         "zero_usage_fields": zero_usage,
         "low_usage_fields": low_usage,
         "subtraction_count": sub_count,
@@ -469,8 +521,37 @@ def score_candidate_orthogonality(expr: str, ortho: dict, active_exprs: list) ->
             if candidate_pair == pair:
                 novelty_score -= 3
     
-    # ── AST structure collision penalty ──
-    # Count how many existing actives use the same skeleton
+    # ── Ratio pattern SELF_CORRELATION penalty (NEW) ──
+    # SC considers signals from same pattern family correlated,
+    # even with different fields. e.g. rev/ev, rev/cap, rev/equity
+    # each adds to the "revenue-as-numerator" family in existing actives.
+    candidate_patterns = _extract_ratio_patterns(expr)
+    pattern_freq = ortho.get("ratio_pattern_freq", {})
+    for (num_fam, den_fam) in candidate_patterns:
+        fam_key = (num_fam, den_fam)
+        usage = pattern_freq.get(fam_key, 0)
+        if usage >= 1:
+            # -3 for 1 existing, -6 for 2+, -10 for 3+
+            penalty = -3 * min(usage, 3)
+            novelty_score += penalty
+    
+    # Also penalize numerator-family overlap: even if denominator differs,
+    # signals sharing the same numerator family tend to be correlated.
+    candidate_nums = set()
+    for (num_fam, _) in candidate_patterns:
+        candidate_nums.add(num_fam)
+    for existing_num in pattern_freq:
+        if existing_num[0] in candidate_nums and existing_num[0] not in _NUM_TO_FAMILY:
+            continue
+    # Simpler: check if any numerator family appears in >1 active
+    for num_fam in _NUM_TO_FAMILY.values():
+        count_in_family = sum(1 for (nf, df), c in pattern_freq.items() if nf == num_fam and c > 0)
+        if count_in_family > 1:
+            novelty_score -= 2  # Cross-field numerator family collision
+    
+    # ── AST structure collision penalty (revised: reverse incentive) ──
+    # Instead of penalizing dominant skeletons, REWARD rare ones
+    # to break lock-in. Rare skeletons get bonus, dominant get small penalty.
     mult_pattern = re.compile(r'rank\([^)]+\)\*rank\([^)]+\)\+')
     sub_pattern = re.compile(r'rank\([^)]+\)\s*-\s*rank\(')
     
@@ -479,16 +560,35 @@ def score_candidate_orthogonality(expr: str, ortho: dict, active_exprs: list) ->
     
     mult_count = ortho.get("multiplication_count", 0)
     sub_count = ortho.get("subtraction_count", 0)
+    total_actives = mult_count + sub_count + ortho.get("add_count", 0) + ortho.get("group_count", 0)
     
     # Actual count of true MULT skeletons (ratio*ratio+ pattern)
     true_mult = sum(1 for s in ortho.get("structures", [])
                     if s["type"] == "multiplication_ratio")
+    true_sub = sum(1 for s in ortho.get("structures", [])
+                   if s["type"] in ("subtraction", "direct_sub"))
     
-    # Penalize adding to the already-dominant skeleton
-    if has_sub and sub_count > mult_count:
-        novelty_score -= 3  # Subtraction is dominant, prefer other structures
-    elif has_mult and true_mult >= 3:
-        novelty_score -= 2  # MULT also getting full
+    # Reverse incentive: rare skeletons get bonus, dominant get small penalty
+    if has_mult and true_mult <= max(1, total_actives // 3):
+        novelty_score += 2  # Reward underrepresented MULT
+    elif has_mult and true_mult > total_actives * 2 // 3:
+        novelty_score -= 2  # MULT already dominant
+    
+    if has_sub and true_sub <= max(1, total_actives // 3):
+        novelty_score += 2  # Reward underrepresented SUB
+    elif has_sub and true_sub > total_actives * 2 // 3:
+        novelty_score -= 2  # SUB already dominant
+    
+    # Also reward rare skeleton types (ind_neut, pure_mult, direct_rank, etc.)
+    for s in ortho.get("structures", []):
+        stype = s["type"]
+        if stype not in ("mult_ratio", "subtraction", "direct_sub", "direct_add"):
+            existing_count = sum(1 for s2 in ortho.get("structures", []) if s2["type"] == stype)
+            # If candidate is this rare type, give bonus
+            if stype in ("ind_neutral",) and "ind_neutral" in expr:
+                novelty_score += 3
+            elif stype == "pure_mult" and "*" in expr and "+" not in expr and "/" in expr:
+                novelty_score += 1
     
     return novelty_score
 
@@ -928,8 +1028,13 @@ def _generate_pure_mult_candidates(ortho: dict, active_exprs: list) -> list:
             if r1_str == r2_str:
                 continue
             r2_fields = set(FIELD_PATTERN.findall(r2_str))
-            if r1_fields & r2_fields:
-                continue  # No field overlap between ratios
+            # Allow limited field overlap: same numerator but different denominator
+            # is fine because different denominators create different normalization.
+            # Only reject if ratios are identical (which already handled above)
+            # or if they share BOTH fields (which means they're the same ratio).
+            overlap = r1_fields & r2_fields
+            if overlap and r1_fields == r2_fields:
+                continue  # Identical field sets — same ratio family, skip
             expr = f"rank({r1_str})*rank({r2_str})"
             if expr in seen:
                 continue
@@ -1258,38 +1363,60 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         seen_exprs.add(c["expr"])
         deduped.append(c)
     
-# ── Skeleton rotation: cycle through skeletons to prevent MULT lock-in ──
-    # Field pool is saturated (15 ACTIVE). MULT alone can't break through.
-    # Rotate through skeleton tiers each batch:
-    #   Phase 0: MULT (with exhaustion detection)
-    #   Phase 1: DIRECT_RANK with ts_* (low operator count, all have ts component)
-    #   Phase 2: THREE_TERM + IND_NEUT + SUB + PURE_MULT + RATIO_LAG
-    # When stuck_batches increments (all S=None), rotation advances.
-    import re
+    # ── Skeleton rotation: cycle through skeletons to prevent MULT lock-in ──
+    # Instead of relying on stuck_batches (which is unreliable), use failed expr skeleton counts.
+    # Use the _get_skeleton_type function for accurate classification.
     
     def _sort_key(c):
         return -c["orthogonality_score"]
     
-    rotation_phase = stuck_batches % 3
-    # Improved rotation: base phase on actual skeleton distribution in failed_expressions
-    # Instead of relying on stuck_batches (which is unreliable), use failed expr skeleton counts
-    mult_in_failed = 0
-    dr_in_failed = 0
-    other_in_failed = 0
+    # Classify failed expressions into skeleton groups using reliable heuristics
+    failed_skeleton_counts = {
+        SKELETON_MULT: 0,
+        SKELETON_DIRECT_RANK: 0,
+        SKELETON_THREE_TERM: 0,
+        SKELETON_IND_NEUT: 0,
+        SKELETON_PURE_MULT: 0,
+        SKELETON_SUB: 0,
+        SKELETON_SINGLE: 0,
+        "other": 0,
+    }
     if failed_exprs:
         for fe in failed_exprs:
-            # Heuristic: MULT patterns have ratio-like structure (A/B * C/D)
-            # DIRECT_RANK patterns have rank(field) +/- rank(ts_*)
-            if re.search(r'rank\([^/]+\*[^/]+\)', fe) or (fe.count('rank(') >= 3 and '/' in fe):
-                mult_in_failed += 1
-            elif re.search(r'rank\([a-z_]+,\d+\)\s*[+-]\s*rank\(', fe) or (re.search(r'ts_', fe) and '/' not in fe):
-                dr_in_failed += 1
+            if "ind_neutral" in fe:
+                failed_skeleton_counts[SKELETON_IND_NEUT] += 1
+            elif "*" in fe and "+" in fe and "/" in fe:
+                # MULT: rank(A/B)*rank(C/D)+W*rank(M)
+                failed_skeleton_counts[SKELETON_MULT] += 1
+            elif "*" in fe and "+" not in fe and "/" in fe:
+                # PURE_MULT: rank(A/B)*rank(C/D)
+                failed_skeleton_counts[SKELETON_PURE_MULT] += 1
+            elif "ts_" in fe and "/" in fe:
+                # THREE_TERM: rank(A/B)+rank(C/D)-rank(ts_*(X,N))
+                failed_skeleton_counts[SKELETON_THREE_TERM] += 1
+            elif "ts_" in fe and "/" not in fe and ("+" in fe or "-" in fe):
+                # DIRECT_RANK: rank(A) +/- W*rank(ts_*(B,N))
+                failed_skeleton_counts[SKELETON_DIRECT_RANK] += 1
+            elif "-" in fe and "/" not in fe and "ts_" in fe:
+                # SUB: rank(fund) - rank(ts_delta(pv1))
+                failed_skeleton_counts[SKELETON_SUB] += 1
             else:
-                other_in_failed += 1
+                failed_skeleton_counts["other"] += 1
+    
+    log(f"  📊 Failed pool skeleton distribution: {dict((k, v) for k, v in failed_skeleton_counts.items() if v > 0)}")
+    
+    # Base rotation on stuck_batches, but override based on actual failed skeleton distribution
+    rotation_phase = stuck_batches % 3
     
     # If MULT dominates failed pool, rotate away from MULT
-    if mult_in_failed > dr_in_failed * 2:
-        log(f"  🔄 Skeleton analysis: MULT={mult_in_failed}, DR={dr_in_failed}, OTHER={other_in_failed}")
+    mult_count = failed_skeleton_counts[SKELETON_MULT]
+    dr_count = failed_skeleton_counts[SKELETON_DIRECT_RANK]
+    three_term_count = failed_skeleton_counts[SKELETON_THREE_TERM]
+    ind_neut_count = failed_skeleton_counts[SKELETON_IND_NEUT]
+    total_failed = sum(failed_skeleton_counts.values())
+    
+    if mult_count > total_failed * 2 // 3 and total_failed >= 3:
+        log(f"  🔄 Skeleton analysis: MULT={mult_count}, DR={dr_count}, 3T={three_term_count}, IND_NEUT={ind_neut_count}")
         if rotation_phase == 0:
             rotation_phase = 1
             log(f"  ⚡ MULT dominates failed pool → forcing rotation to Phase 1 (DIRECT_RANK)")
@@ -1297,11 +1424,19 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
             rotation_phase = 1
             log(f"  ⚡ MULT dominates failed pool → forcing rotation to Phase 1 (DIRECT_RANK)")
     # If DIRECT_RANK dominates, skip to Phase 2 (mixed exploration)
-    elif dr_in_failed > mult_in_failed * 2 and dr_in_failed >= 3:
-        log(f"  🔄 Skeleton analysis: MULT={mult_in_failed}, DR={dr_in_failed}, OTHER={other_in_failed}")
+    elif dr_count > total_failed * 2 // 3 and dr_count >= 3:
+        log(f"  🔄 Skeleton analysis: MULT={mult_count}, DR={dr_count}, 3T={three_term_count}, IND_NEUT={ind_neut_count}")
         if rotation_phase <= 1:
             rotation_phase = 2
             log(f"  ⚡ DIRECT_RANK dominates failed pool → skipping to Phase 2 (mixed exploration)")
+    # If THREE_TERM dominates, skip to Phase 0 with MULT exhaustion override
+    elif three_term_count > total_failed * 2 // 3 and three_term_count >= 3:
+        log(f"  🔄 THREE_TERM dominates failed pool → forcing Phase 0 reset (with exhaustion)")
+        rotation_phase = 0
+    # If IND_NEUT dominates, skip to Phase 1 (DIRECT_RANK is next exploration target)
+    elif ind_neut_count > 0 and ind_neut_count >= 2 and total_failed >= 4:
+        log(f"  🔄 IND_NEUT={ind_neut_count} in failed pool → forcing Phase 1 (DIRECT_RANK)")
+        rotation_phase = 1
     
     # Split candidates by skeleton type for targeted selection
     skeleton_groups = {}
@@ -1484,10 +1619,31 @@ def adaptive_poll(session, url: str, poll_name: str,
                 time.sleep(retry)
                 continue
         except Exception as e:
+            error_msg = str(e)
             log(f"⚠️ Poll error: {e}")
-            # Transient error: retry after short delay, don't sleep full interval
-            time.sleep(5)
-            continue
+            
+            # Auto-recover from SSL/Connection errors by refreshing session
+            if ("SSLError" in error_msg or "ConnectionError" in error_msg or "SSLEOFError" in error_msg):
+                if not refresh_tried:
+                    log("🔄 SSL/Connection error detected, refreshing session...", "warn")
+                    try:
+                        new_s = fresh_session()
+                        _last_auth_time = time.time()
+                        # Note: we can't update the passed-in session object,
+                        # but the caller should use the returned session next time
+                    except Exception as refresh_err:
+                        log(f"❌ Session refresh failed: {refresh_err}", "error")
+                    refresh_tried = True
+                    time.sleep(3)  # Let proxy settle
+                    continue
+                else:
+                    log("⚠️ Session already refreshed, retrying connection...", "warn")
+                    time.sleep(10)  # Longer delay after refresh
+                    continue
+            else:
+                # Transient error: retry after short delay, don't sleep full interval
+                time.sleep(5)
+                continue
         
         # Adaptive interval: every 2 min without result, back off
         if elapsed > 120 and interval < fallback_interval:
