@@ -31,6 +31,10 @@ def add_cors(response):
 HOME = Path.home()
 STATE_FILE = HOME / ".wq_workflow_v2.json"  # fallback
 LOG_FILE = HOME / ".wq_workflow_v2.log"
+
+# ─── In-memory cache ─────────────────────────────────────────────────────
+_status_cache = {"data": None, "ts": 0}
+CACHE_TTL = 2  # seconds — data rarely changes this frequently
 BATCH_FILE = HOME / ".wq_batch_state.json"
 STDERR_FILE = HOME / ".wq_workflow_v2_stderr.log"
 
@@ -44,26 +48,36 @@ def read_json_safe(path):
     return {}
 
 def read_lines_safe(path, n=100):
+    """Read last n lines efficiently — uses tail(1) to avoid loading the whole file."""
+    import subprocess
     try:
         if not path.exists():
             return []
-        text = path.read_text()
+        out = subprocess.check_output(["tail", "-n", str(n), str(path)], timeout=1)
+        text = out.decode("utf-8", errors="replace")
         lines = text.strip().split("\n")
-        parsed = []
-        for line in lines[-n:]:
-            entry = {"raw": line}
-            m = re.match(r"(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\|(\w+)\|(.+)", line)
-            if m:
-                entry["time"] = m.group(1)
-                entry["level"] = m.group(2)
-                entry["msg"] = m.group(3)
+    except Exception:
+        try:
+            if path.exists():
+                text = path.read_text()
+                lines = text.strip().split("\n")
             else:
-                entry["level"] = "INFO"
-                entry["msg"] = line
-            parsed.append(entry)
-        return parsed
-    except:
-        return []
+                return []
+        except:
+            return []
+    parsed = []
+    for line in lines[-n:]:
+        entry = {"raw": line}
+        m = re.match(r"(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\|(\w+)\|(.+)", line)
+        if m:
+            entry["time"] = m.group(1)
+            entry["level"] = m.group(2)
+            entry["msg"] = m.group(3)
+        else:
+            entry["level"] = "INFO"
+            entry["msg"] = line
+        parsed.append(entry)
+    return parsed
 
 def extract_fields(expr):
     """Extract data fields from a WQ alpha expression."""
@@ -101,20 +115,24 @@ def compute_duration(started_at):
 
 @app.route("/api/status")
 def api_status():
-    # Read workflow state from SQLite
+    """Full pipeline status (kept for backward compat, /api/poll is preferred)."""
+    return jsonify(_get_status_data())
+
+
+def _get_status_data():
+    """Shared helper: return the full status dict used by /api/status and /api/poll."""
+    global _status_cache
+    now = time.time()
+    if _status_cache["data"] and (now - _status_cache["ts"]) < CACHE_TTL:
+        return dict(_status_cache["data"])  # shallow copy — caller may mutate
+
     full_state = wq_db.load_workflow_state("workflow")
-    
-    # Fallback to JSON if SQLite has no data
     if not full_state:
         full_state = read_json_safe(STATE_FILE)
-    
     batch_state = read_json_safe(BATCH_FILE)
     log_entries = read_lines_safe(LOG_FILE, 100)
-    
-    # Cumulative stats from SQLite
     cumulative = wq_db.get_cumulative_stats()
-    
-    # ── Field usage ──
+
     fields_used = full_state.get("fields_used", {})
     max_count = max(fields_used.values()) if fields_used else 1
     field_chart = [
@@ -122,12 +140,10 @@ def api_status():
         for k, v in sorted(fields_used.items(), key=lambda x: -x[1])
     ] if fields_used else []
 
-    # ── Current batch info ──
     batch = full_state.get("current_batch", [])
     batch_idx = full_state.get("batch_idx", 0)
     current = batch[batch_idx] if batch and batch_idx < len(batch) else None
 
-    # ── SIM progress from log ──
     sim_progress = None
     for entry in reversed(log_entries):
         raw = entry.get("raw", "")
@@ -140,57 +156,67 @@ def api_status():
     if current:
         current["sim_progress"] = sim_progress
 
-    # ── Session timing ──
     started_at = full_state.get("started_at", "")
     duration = compute_duration(started_at)
 
-    # ── Last activity from latest log entry ──
     last_activity = None
     if log_entries:
         last_raw = log_entries[-1].get("raw", "")
         last_activity = last_raw[-120:] if len(last_raw) > 120 else last_raw
 
-    return jsonify({
-        # Pipeline basics
+    data = {
         "status": full_state.get("status", "idle"),
         "phase": full_state.get("phase", "init"),
         "active_count": full_state.get("active_count", 0),
         "target": 20,
-
-        # Timing
         "started_at": started_at,
         "last_updated": full_state.get("last_updated", ""),
         "duration": duration,
         "last_activity": last_activity,
-
-        # Current candidate
         "current_candidate": current,
-
-        # Batch progress
         "batch_total": len(batch),
         "batch_index": batch_idx + 1 if batch else 0,
         "batch_id": batch_state.get("batch_id", ""),
-
-        # Run totals (from state)
         "candidates_generated": full_state.get("candidates_generated", 0),
         "candidates_passed_is": full_state.get("candidates_passed_is", 0),
         "candidates_passed_sc": full_state.get("candidates_passed_sc", 0),
         "candidates_submitted": full_state.get("candidates_submitted", 0),
         "iterations": full_state.get("iterations", 0),
-
-        # Cumulative stats (from SQLite)
         "cumulative_stats": cumulative,
-
-        # Errors
         "errors": full_state.get("errors", [])[-5:],
-
-        # Charts & logs
         "field_chart": field_chart,
         "log": log_entries,
-
-        # Full actives
         "actives": full_state.get("actives_data", []),
-    })
+    }
+    # If cumulative_stats is more accurate (pipeline updates it via record_alpha_event),
+    # override the workflow_state counters with cumulative values
+    if cumulative:
+        if cumulative.get("total_generated", 0) > data["candidates_generated"]:
+            data["candidates_generated"] = cumulative["total_generated"]
+        if cumulative.get("total_is_pass", 0) > data["candidates_passed_is"]:
+            data["candidates_passed_is"] = cumulative["total_is_pass"]
+        if cumulative.get("total_sc_pass", 0) > data["candidates_passed_sc"]:
+            data["candidates_passed_sc"] = cumulative["total_sc_pass"]
+        if cumulative.get("total_submitted", 0) > data["candidates_submitted"]:
+            data["candidates_submitted"] = cumulative["total_submitted"]
+    _status_cache["data"] = data
+    _status_cache["ts"] = now
+    return dict(_status_cache["data"])
+
+
+@app.route("/api/poll")
+def api_poll():
+    """Single endpoint returning all dashboard data in one request."""
+    data = _get_status_data()
+    # Add recent history (last 10 events) and orthogonality
+    hist = wq_db.get_all_alpha_history(limit=50)
+    data["history"] = [dict(r) for r in hist.get("events", [])]
+    data["history_total"] = hist.get("total", 0)
+    o = wq_db.load_workflow_state("orthogonality")
+    if not o:
+        o = read_json_safe(HOME / ".wq_orthogonality.json")
+    data["orthogonality"] = o if o.get("nodes") else {"nodes": [], "edges": [], "node_count": 0, "edge_count": 0}
+    return jsonify(data)
 
 # ─── All Active Alphas with Details ────────────────────────────────────
 
@@ -538,4 +564,4 @@ if __name__ == "__main__":
     print(f"   DB:      {wq_db.DB_PATH}")
     print(f"   State:   {STATE_FILE} (fallback)")
     print(f"   Log:     {LOG_FILE}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

@@ -158,12 +158,18 @@ open http://localhost:8765
 
 ```
 wq-alpha-pipeline/
-├── wq_workflow_v2.py               # 主工作流 (2311 行)
+├── wq_workflow_v2.py               # 主工作流 (2652 行)
 │   ├── P1(2026-05-30): 修复 S=None 被误判 IS PASS → 死对候选不再浪费 SC slot
 │   ├── P2(2026-05-30): 骨架优先级统一在 _sort_key 管理，移除生成器预加成失真
 │   ├── P3(2026-05-30): stuck 模式旁路多样性约束，DIRECT_RANK 优先选入
 │   ├── P4(2026-05-30): 骨架旋转系统 — MULT 枯竭检测 + 3 Phase 轮换
-│   └── P5(2026-05-30): fitness 补偿软通过 — S≥1.0+F≥0.8 也能进调参
+│   ├── P5(2026-05-30): fitness 补偿软通过 — S≥1.0+F≥0.8 也能进调参
+│   ├── P6(2026-06-01): quick_test HTTP 失败保守化 → return False，不泄露弱候选进 Full IS
+│   ├── P7(2026-06-01): SC 轮询超时 1h→4h，匹配繁忙账户 SC 排队时长
+│   ├── P8(2026-06-01): SC 403 fallback 死代码修复 — 非 403 不调 json()，显式 Exception 捕获
+│   ├── P9(2026-06-01): tune sim POST 409 幂等性 — 重复表达式检测后复用现有 sim_id 继续轮询
+│   ├── P10(2026-06-01): ratio_prefix 骨架感知提取 — regex 替代 rsplit(+)，DIRECT_RANK/THREE_TERM 不再生成畸形表达式
+│   └── P11(2026-06-01): adaptive_poll 卡死检测升级 — 任意进度停滞（35%/15% 也触发），不限于 0%
 ├── scripts/
 │   └── wq_pipeline.py              # 旧版三阶段流水线（已废弃）
 ├── config/
@@ -187,7 +193,7 @@ wq-alpha-pipeline/
 
 - **替代 cron**：旧版 6 个定时任务 → 1 个后台进程。IS/SC 回测时长 3-40 分钟不等，固定时间切片要么空转要么漏结果。单进程内部自适应轮询，IS 完成立即进 SC。
 - **launchd 守护**：macOS 原生服务管理，`KeepAlive` + `ThrottleInterval` 30s 自动恢复，等同于 Linux systemd。
-- **自适应轮询**：IS/SC 提交后不等固定时间，从短间隔开始逐级降频（15s → 30s → 60s → 120s），卡 0% 超时自动放弃。
+- **自适应轮询**：IS/SC 提交后不等固定时间，从短间隔开始逐级降频（15s → 30s → 60s → 120s），任意进度停滞超时自动放弃（不再仅监禁 0%）。
 
 ### Skeleton Rotation（2026-05-30 新特性）
 

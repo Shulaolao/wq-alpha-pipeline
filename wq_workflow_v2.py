@@ -35,7 +35,7 @@ if _env_path.exists():
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-import requests, urllib3
+import requests, urllib3, re
 urllib3.disable_warnings()
 _TLS_CTX = ssl.create_default_context()
 _TLS_CTX.check_hostname = False
@@ -146,14 +146,28 @@ logger.addHandler(_logger)
 def log(msg, level="info"):
     getattr(logger, level, logger.info)(msg)
 
-# ═══ State Management ═════════════════════════════
+# ═══ Database ═══════════════════════════════════════════════════════
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+import wq_db as _wqdb
+STATE_KEY = "workflow"
+
+# Init DB on startup
+_wqdb.init_db()
+
+# Migrate existing state.json to SQLite (one-time)
+if STATE_FILE.exists():
+    _wqdb.export_state_to_db(STATE_FILE)
+
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        state = json.loads(STATE_FILE.read_text())
-        # Handle old key name "failed_exprs" → migrate to "failed_expressions"
-        if "failed_exprs" in state and "failed_expressions" not in state:
-            state["failed_expressions"] = state.pop("failed_exprs")
-        return state
+    """Load workflow state from SQLite."""
+    raw = _wqdb.load_workflow_state(STATE_KEY)
+    # Handle old key name "failed_exprs" → migrate to "failed_expressions"
+    if "failed_exprs" in raw and "failed_expressions" not in raw:
+        raw["failed_expressions"] = raw.pop("failed_exprs")
+    if raw:
+        return raw
     return {
         "status": "idle",
         "phase": "init",
@@ -170,18 +184,28 @@ def load_state() -> dict:
         "errors": [],
         "started_at": None,
         "last_updated": None,
-        "failed_expressions": [],   # expressions that have been fully exhausted
-        "stuck_batches": 0,          # consecutive batches with 0 passes
-        "batches_since_optimization": 0,  # batches since last meta-optimization
-        "last_optimization_at": None,     # ISO timestamp of last optimization run
+        "failed_expressions": [],
+        "stuck_batches": 0,
+        "batches_since_optimization": 0,
+        "last_optimization_at": None,
     }
 
 def save_state(state: dict):
+    """Save workflow state to SQLite."""
     state["last_updated"] = datetime.now().isoformat()
-    # Truncate errors to last 20 to prevent file bloat
+    # Truncate errors to last 20 to prevent bloat
     if len(state.get("errors", [])) > 20:
         state["errors"] = state["errors"][-20:]
-    STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+    _wqdb.save_workflow_state(STATE_KEY, state)
+
+# ═══ Enhanced log: also write to SQLite ─────────────
+_original_log = log
+def log(msg, level="info"):
+    _original_log(msg, level)
+    try:
+        _wqdb.log_to_db(level.upper(), msg)
+    except Exception:
+        pass  # Never crash workflow if DB log fails
 
 # ═══ Proxy / Connectivity ═══════════════════════════
 CLASH_SOCK = "/tmp/verge/verge-mihomo.sock"
@@ -934,64 +958,70 @@ def _generate_direct_rank_candidates(ortho: dict, active_exprs: list) -> list:
     fund_fields = ["revenue", "debt", "operating_income", "cap", "enterprise_value", "equity"]
     pv1_fields = ["returns", "volume", "adv20", "high", "low", "open", "close", "vwap"]
 
+    # Base combos: (left, right, op, base_weight, suffix, extra_weights)
+    # extra_weights allows generating additional weight variants beyond the base
     combos = [
         # ── Pattern 1: ts_delta wrapper on pv1 side (lowest operator count) ──
-        # rank(fund_A) - W*rank(ts_delta(pv1, N))
-        ("debt", "ts_delta(close,5)", "subtract", 1.0, "debt_dcl5"),
-        ("revenue", "ts_delta(close,5)", "subtract", 1.0, "rev_dcl5"),
-        ("cap", "ts_delta(close,5)", "subtract", 1.0, "cap_dcl5"),
-        ("enterprise_value", "ts_delta(close,5)", "subtract", 1.0, "ev_dcl5"),
-        ("operating_income", "ts_delta(close,5)", "subtract", 1.0, "oi_dcl5"),
-        ("equity", "ts_delta(close,5)", "subtract", 1.0, "eq_dcl5"),
+        ("debt", "ts_delta(close,5)", "subtract", 1.0, "debt_dcl5", [0.5, 0.7]),
+        ("revenue", "ts_delta(close,5)", "subtract", 1.0, "rev_dcl5", [0.5, 0.7]),
+        ("cap", "ts_delta(close,5)", "subtract", 1.0, "cap_dcl5", [0.5, 0.7]),
+        ("enterprise_value", "ts_delta(close,5)", "subtract", 1.0, "ev_dcl5", [0.5, 0.7]),
+        ("operating_income", "ts_delta(close,5)", "subtract", 1.0, "oi_dcl5", [0.5, 0.7]),
+        ("equity", "ts_delta(close,5)", "subtract", 1.0, "eq_dcl5", [0.5, 0.7]),
 
-        ("debt", "ts_delta(high,5)", "subtract", 1.0, "debt_dhi5"),
-        ("revenue", "ts_delta(high,5)", "subtract", 1.0, "rev_dhi5"),
+        ("debt", "ts_delta(high,5)", "subtract", 1.0, "debt_dhi5", [0.5, 0.7]),
+        ("revenue", "ts_delta(high,5)", "subtract", 1.0, "rev_dhi5", [0.5, 0.7]),
 
         # ── Pattern 2: ts_mean momentum on pv1 side ──
-        # rank(fund_A) - W*rank(ts_mean(pv1, N))
-        ("debt", "ts_mean(returns,5)", "subtract", 1.0, "debt_mret5"),
-        ("revenue", "ts_mean(returns,5)", "subtract", 1.0, "rev_mret5"),
-        ("cap", "ts_mean(returns,5)", "subtract", 1.0, "cap_mret5"),
-        ("equity", "ts_mean(returns,5)", "subtract", 1.0, "eq_mret5"),
-        ("enterprise_value", "ts_mean(returns,5)", "subtract", 1.0, "ev_mret5"),
-        ("operating_income", "ts_mean(volume,10)", "subtract", 1.0, "oi_mvol10"),
+        ("debt", "ts_mean(returns,5)", "subtract", 1.0, "debt_mret5", [0.5, 0.7]),
+        ("revenue", "ts_mean(returns,5)", "subtract", 1.0, "rev_mret5", [0.5, 0.7]),
+        ("cap", "ts_mean(returns,5)", "subtract", 1.0, "cap_mret5", [0.5, 0.7]),
+        ("equity", "ts_mean(returns,5)", "subtract", 1.0, "eq_mret5", [0.5, 0.7]),
+        ("enterprise_value", "ts_mean(returns,5)", "subtract", 1.0, "ev_mret5", [0.5, 0.7]),
+        ("operating_income", "ts_mean(volume,10)", "subtract", 1.0, "oi_mvol10", [0.5, 0.7]),
 
         # ── Pattern 3: ts_rank wrapping on fundamental side ──
-        # rank(ts_rank(fund, 250)) +/- W*rank(pv1)
-        ("ts_rank(debt,250)", "returns", "add", 1.0, "tsr_debt_ret"),
-        ("ts_rank(revenue,250)", "returns", "add", 1.0, "tsr_rev_ret"),
-        ("ts_rank(cap,250)", "returns", "add", 1.0, "tsr_cap_ret"),
-        ("ts_rank(equity,250)", "returns", "subtract", 1.0, "tsr_eq_ret_sub"),
-        ("ts_rank(enterprise_value,250)", "returns", "subtract", 1.0, "tsr_ev_ret_sub"),
-        ("ts_rank(operating_income,250)", "volume", "subtract", 1.0, "tsr_oi_vol"),
+        ("ts_rank(debt,250)", "returns", "add", 1.0, "tsr_debt_ret", [0.5, 0.7]),
+        ("ts_rank(revenue,250)", "returns", "add", 1.0, "tsr_rev_ret", [0.5, 0.7]),
+        ("ts_rank(cap,250)", "returns", "add", 1.0, "tsr_cap_ret", [0.5, 0.7]),
+        ("ts_rank(equity,250)", "returns", "subtract", 1.0, "tsr_eq_ret_sub", [0.5, 0.7]),
+        ("ts_rank(enterprise_value,250)", "returns", "subtract", 1.0, "tsr_ev_ret_sub", [0.5, 0.7]),
+        ("ts_rank(operating_income,250)", "volume", "subtract", 1.0, "tsr_oi_vol", [0.5, 0.7]),
 
         # ── Pattern 4: cross-domain (fund + native-ts pv1, proven working) ──
-        # rank(debt) - 2*rank(returns) ← LLnNAYv1 proven
-        ("debt", "returns", "subtract", 2.0, "debt_ret_sub2"),
-        ("revenue", "returns", "subtract", 1.0, "rev_ret_sub"),
-        ("cap", "returns", "add", 1.0, "cap_ret_add"),
-        ("enterprise_value", "returns", "subtract", 1.0, "ev_ret_sub"),
-        ("equity", "returns", "subtract", 1.0, "eq_ret_sub"),
-        ("operating_income", "returns", "subtract", 1.0, "oi_ret_sub"),
+        ("debt", "returns", "subtract", 2.0, "debt_ret_sub2", []),
+        ("revenue", "returns", "subtract", 1.0, "rev_ret_sub", [0.5, 0.7, 0.9]),
+        ("cap", "returns", "add", 1.0, "cap_ret_add", [0.5, 0.7, 0.9]),
+        ("enterprise_value", "returns", "subtract", 1.0, "ev_ret_sub", [0.5, 0.7, 0.9]),
+        ("equity", "returns", "subtract", 1.0, "eq_ret_sub", [0.5, 0.7, 0.9]),
+        ("operating_income", "returns", "subtract", 1.0, "oi_ret_sub", [0.5, 0.7, 0.9]),
     ]
 
     seen = set()
-    for left, right, op, w, suffix in combos:
-        if op == "add":
-            expr = f"rank({left})+{w}*rank({right})"
-        else:
-            expr = f"rank({left})-{w}*rank({right})"
-        if expr in seen or expr in active_exprs:
-            continue
-        seen.add(expr)
-        score = score_candidate_orthogonality(expr, ortho, active_exprs)
-        name = f"DR_{suffix}"[:40]
-        candidates.append({
-            "name": name, "expr": expr,
-            "orthogonality_score": score,
-            "skeleton": SKELETON_DIRECT_RANK,
-            "weight": w,
-        })
+    for left, right, op, base_w, suffix, extra_ws in combos:
+        # Always generate base weight variant
+        weights_to_try = [base_w]
+        # Also generate extra weight variants (different S/F combos)
+        for ew in extra_ws:
+            if ew != base_w:
+                weights_to_try.append(ew)
+        
+        for w in weights_to_try:
+            if op == "add":
+                expr = f"rank({left})+{w}*rank({right})"
+            else:
+                expr = f"rank({left})-{w}*rank({right})"
+            if expr in seen or expr in active_exprs:
+                continue
+            seen.add(expr)
+            score = score_candidate_orthogonality(expr, ortho, active_exprs)
+            name = f"DR_{suffix}_w{int(w*10)}"[:40]
+            candidates.append({
+                "name": name, "expr": expr,
+                "orthogonality_score": score,
+                "skeleton": SKELETON_DIRECT_RANK,
+                "weight": w,
+            })
     candidates.sort(key=lambda x: -x["orthogonality_score"])
     return candidates
 
@@ -1235,11 +1265,37 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         return -c["orthogonality_score"]
     
     rotation_phase = stuck_batches % 3
-    # Aggressive trigger: if failed_expressions > 20, always rotate
-    # (field pool is clearly saturated, MULT has exhausted its space)
-    if failed_exprs and len(failed_exprs) > 20 and rotation_phase == 0:
-        rotation_phase = 1
-        log(f"  ⚡ {len(failed_exprs)} failed exprs → forcing rotation Phase 1")
+    # Improved rotation: base phase on actual skeleton distribution in failed_expressions
+    # Instead of relying on stuck_batches (which is unreliable), use failed expr skeleton counts
+    mult_in_failed = 0
+    dr_in_failed = 0
+    other_in_failed = 0
+    if failed_exprs:
+        for fe in failed_exprs:
+            # Heuristic: MULT patterns have ratio-like structure (A/B * C/D)
+            # DIRECT_RANK patterns have rank(field) +/- rank(ts_*)
+            if re.search(r'rank\([^/]+\*[^/]+\)', fe) or (fe.count('rank(') >= 3 and '/' in fe):
+                mult_in_failed += 1
+            elif re.search(r'rank\([a-z_]+,\d+\)\s*[+-]\s*rank\(', fe) or (re.search(r'ts_', fe) and '/' not in fe):
+                dr_in_failed += 1
+            else:
+                other_in_failed += 1
+    
+    # If MULT dominates failed pool, rotate away from MULT
+    if mult_in_failed > dr_in_failed * 2:
+        log(f"  🔄 Skeleton analysis: MULT={mult_in_failed}, DR={dr_in_failed}, OTHER={other_in_failed}")
+        if rotation_phase == 0:
+            rotation_phase = 1
+            log(f"  ⚡ MULT dominates failed pool → forcing rotation to Phase 1 (DIRECT_RANK)")
+        elif rotation_phase == 2:
+            rotation_phase = 1
+            log(f"  ⚡ MULT dominates failed pool → forcing rotation to Phase 1 (DIRECT_RANK)")
+    # If DIRECT_RANK dominates, skip to Phase 2 (mixed exploration)
+    elif dr_in_failed > mult_in_failed * 2 and dr_in_failed >= 3:
+        log(f"  🔄 Skeleton analysis: MULT={mult_in_failed}, DR={dr_in_failed}, OTHER={other_in_failed}")
+        if rotation_phase <= 1:
+            rotation_phase = 2
+            log(f"  ⚡ DIRECT_RANK dominates failed pool → skipping to Phase 2 (mixed exploration)")
     
     # Split candidates by skeleton type for targeted selection
     skeleton_groups = {}
@@ -1378,16 +1434,19 @@ def adaptive_poll(session, url: str, poll_name: str,
                 if pct_pct is not None and time.time() - last_slowdown > 30:
                     log(f"⏳ {poll_name}: {pct_pct:.0f}% ({elapsed:.0f}s)")
                 
-                # Stuck detection: if progress stuck at 0 past threshold, abort
+                # Stuck detection: if progress hasn't changed for stuck_threshold seconds, abort
+                # Works at ANY progress level (0%, 35%, 15%) not just 0%
                 if stuck_threshold > 0 and isinstance(pct, (int, float)):
-                    if pct == 0 and elapsed > 30:
+                    current_progress = pct
+                    if current_progress == last_progress and elapsed > 30:
                         if stuck_since is None:
                             stuck_since = time.time()
                         elif time.time() - stuck_since > stuck_threshold:
-                            log(f"❌ {poll_name}: stuck at 0% for {stuck_threshold}s, aborting", "error")
+                            log(f"❌ {poll_name}: stuck at {current_progress*100:.0f}% for {stuck_threshold}s, aborting", "error")
                             return None
                     else:
-                        stuck_since = None  # progress moved, reset
+                        stuck_since = None
+                        last_progress = current_progress
             elif r.status_code == 429:
                 retry = int(r.headers.get("Retry-After", 60))
                 log(f"⚠️ 429: waiting {retry}s")
@@ -1570,6 +1629,13 @@ class Workflow:
                 log(f"\n{'='*50}")
                 log(f"🎯 Processing candidate {idx+1}/{len(candidates)}: {cand['name']}")
                 
+                # ── RECORD: Generated ──
+                _wqdb.record_alpha_event(
+                    name=cand["name"], expr=cand["expr"],
+                    event_type="generated",
+                    phase="generate"
+                )
+                
                 self.state["batch_idx"] = idx
                 self.state["phase"] = "quick_test"
                 self.save_checkpoint()
@@ -1578,6 +1644,14 @@ class Workflow:
                 quick_pass = self._quick_test(cand)
                 if quick_pass == "skip":
                     log(f"⏩ {cand['name']}: S=None detected, skip (dead pair)")
+                    # ── RECORD: dead pair failure ──
+                    _wqdb.record_alpha_event(
+                        name=cand["name"], expr=cand["expr"],
+                        event_type="failed",
+                        is_status="S=None",
+                        phase="quick_test",
+                        notes="Dead pair: S=None"
+                    )
                     # Immediately register failed expression so it's skipped next batch
                     failed_list = self.state.setdefault("failed_expressions", [])
                     expr = cand.get("expr", "")
@@ -1603,10 +1677,28 @@ class Workflow:
                     success = self._tune_and_retry(cand, ortho, "is")
                     if not success:
                         log(f"✖️ {cand['name']}: all IS variations failed, skip")
+                        # ── RECORD: IS final failure ──
+                        _wqdb.record_alpha_event(
+                            name=cand["name"], expr=cand.get("expr", ""),
+                            event_type="failed",
+                            alpha_id=cand.get("alpha_id"),
+                            sharpe=cand.get("sharpe"),
+                            fitness=cand.get("fitness"),
+                            is_status="IS_FAIL",
+                            phase="full_sim",
+                            notes="All IS variations failed"
+                        )
+                        # Register the base expression to prevent regeneration
+                        failed_list = self.state.setdefault("failed_expressions", [])
+                        base_expr = cand.get("expr", "")
+                        if base_expr and base_expr not in failed_list:
+                            failed_list.append(base_expr)
+                            log(f"  📝 Registered failed base expr ({len(failed_list)} total): {base_expr[:60]}")
+                            if len(failed_list) > 100:
+                                self.state["failed_expressions"] = failed_list[-100:]
                         self.state["batch_progress"] = idx + 1
                         self.save_checkpoint()
-                        notify(f"候选失败 ✖️ {cand['name']}\
-IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败",
+                        notify(f"候选失败 ✖️ {cand['name']} IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败",
                                emoji="⚠️", dedup_key=f"cand_fail_{cand.get('alpha_id','')}")
                         continue
                 elif cand.get("is_status") == "TUNE":
@@ -1614,28 +1706,23 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                     success = self._tune_and_retry(cand, ortho, "is")
                     if not success:
                         log(f"✖️ {cand['name']}: tune also couldn't fix checks, skip")
+                        # Register the base expression
+                        failed_list = self.state.setdefault("failed_expressions", [])
+                        base_expr = cand.get("expr", "")
+                        if base_expr and base_expr not in failed_list:
+                            failed_list.append(base_expr)
+                            log(f"  📝 Registered failed base expr ({len(failed_list)} total): {base_expr[:60]}")
+                            if len(failed_list) > 100:
+                                self.state["failed_expressions"] = failed_list[-100:]
                         self.state["batch_progress"] = idx + 1
                         self.save_checkpoint()
-                        notify(f"调参未修复 ⚠️ {cand['name']}\nS={cand.get('sharpe','?')} 调参后仍无法通过check",
+                        notify(f"调参未修复 ⚠️ {cand['name']} IS {cand.get('sharpe','?')} 调参后仍无法通过check",
                                emoji="⚠️", dedup_key=f"tune_fail_{cand.get('alpha_id','')}")
                         continue
                 
-                # ── 4c. IS OPTIMIZATION (post-pass tune) ──
-                is_sharpe = cand.get("sharpe", 0) or 0
-                is_fitness = cand.get("fitness", 0) or 0
-                if cand.get("is_status") == "PASS" and self._should_optimize(is_sharpe, is_fitness):
-                    strategy = self._get_optimization_strategy(is_sharpe, is_fitness)
-                    # ── Strategy dispatch ──
-                    log(f"📈 IS PASS S={is_sharpe:.2f} F={is_fitness:.2f}")
-                    log(f"   {strategy['description']}")
-                    log(f"   Grid: {strategy['strategy_desc']}")
-                    improved = self._tune_and_retry(cand, ortho, "is", is_optimization=True, opt_strategy=strategy)
-                    if improved:
-                        log(f"✅ Optimization improved S! Continuing with optimized variant")
-                    else:
-                        log(f"ℹ️ No improvement from optimization, proceeding with original")
-                
-                # ── 4d. SC SUBMIT → Adaptive SC Poll ──
+                # ── 4c. SC SUBMIT FIRST (priority over IS optimization) ──
+                # Rationale: IS PASS alpha MUST be tested by SC before any optimization.
+                # Tuning first risks losing the original IS PASS alpha if all variations fail.
                 self.state["phase"] = "sc_submit"
                 self.save_checkpoint()
                 success = self._run_sc(cand)
@@ -1645,12 +1732,50 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                     success = self._tune_and_retry(cand, ortho, "sc")
                     if not success:
                         log(f"✖️ {cand['name']}: all SC variations failed, skip")
+                        # ── RECORD: SC final failure ──
+                        _wqdb.record_alpha_event(
+                            name=cand["name"], expr=cand.get("expr", ""),
+                            event_type="sc_fail",
+                            alpha_id=cand.get("alpha_id"),
+                            sharpe=cand.get("sharpe"),
+                            sc_value=cand.get("sc_value"),
+                            is_status="SC_FAIL",
+                            phase="sc_submit",
+                            notes="All SC variations failed"
+                        )
                         self.state["batch_progress"] = idx + 1
                         self.save_checkpoint()
                         notify(f"SC耗尽 ✖️ {cand['name']}\nSC={cand.get('sc_value','?')}，换字段调参后仍失败",
                                emoji="⚠️", dedup_key=f"sc_fail_{cand.get('alpha_id','')}")
                         continue
 
+                # ── 4d. IS OPTIMIZATION (post-SC-pass tune) ──
+                # Only optimize AFTER SC passes — the alpha is already secured as ACTIVE.
+                # Tuning now can only improve, never lose (the original SC-passed alpha stays ACTIVE).
+                is_sharpe = cand.get("sharpe", 0) or 0
+                is_fitness = cand.get("fitness", 0) or 0
+                if cand.get("is_status") == "PASS" and self._should_optimize(is_sharpe, is_fitness):
+                    strategy = self._get_optimization_strategy(is_sharpe, is_fitness)
+                    # ── Strategy dispatch ──
+                    log(f"📈 SC PASS + IS OPTIMIZATION S={is_sharpe:.2f} F={is_fitness:.2f}")
+                    log(f"   {strategy['description']}")
+                    log(f"   Grid: {strategy['strategy_desc']}")
+                    log(f"   ⚠️ Original alpha already SC-PASS and ACTIVE — tuning is safe/improvement-only")
+                    improved = self._tune_and_retry(cand, ortho, "is", is_optimization=True, opt_strategy=strategy)
+                    if improved:
+                        log(f"✅ Optimization improved S! Will re-test SC with optimized variant")
+                        # After IS optimization, re-submit SC for the improved variant
+                        self.state["phase"] = "sc_submit"
+                        self.save_checkpoint()
+                        success = self._run_sc(cand)
+                        if not success:
+                            log(f"❌ Optimized alpha SC failed, falling back to original SC-passed alpha")
+                            # Keep original SC-passed alpha as ACTIVE (it was never removed)
+                            log(f"   Original SC-passed alpha retained as ACTIVE")
+                        # If improved alpha SC passes, it replaces original in active set
+                    else:
+                        log(f"ℹ️ No improvement from optimization, keeping SC-passed original")
+                
                 # ── 4e. SUBMIT ──
                 self.state["phase"] = "submit"
                 self.save_checkpoint()
@@ -1669,21 +1794,45 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
         if any_passed:
             self.state["stuck_batches"] = 0
         else:
-            self.state["stuck_batches"] = self.state.get("stuck_batches", 0) + 1
-            # Register failed expressions for dead-end detection
-            failed_list = self.state.setdefault("failed_expressions", [])
-            for c in candidates:
-                expr = c.get("expr", "")
-                if expr and expr not in failed_list:
-                    failed_list.append(expr)
-                    log(f"  📝 Registered failed expr ({len(failed_list)} total): {expr[:60]}")
-            # Keep list bounded
-            if len(failed_list) > 50:
-                self.state["failed_expressions"] = failed_list[-50:]
-            if self.state["stuck_batches"] >= 3:
-                log(f"⚠️  {self.state['stuck_batches']} consecutive batches with 0 passes. "
-                    f"Switching to stuck mode (skip zero-occupancy fields).",
-                    "warn")
+            # Only count as stuck if at least one candidate reached full_sim (not quick_test skipped)
+            reached_full_sim = any(
+                c.get("sim_id") or c.get("alpha_id") or c.get("sharpe") is not None
+                for c in candidates
+            )
+            if reached_full_sim:
+                # All candidates that passed quick_test failed in full_sim/tune
+                self.state["stuck_batches"] = self.state.get("stuck_batches", 0) + 1
+                # Register failed expressions for dead-end detection
+                failed_list = self.state.setdefault("failed_expressions", [])
+                for c in candidates:
+                    expr = c.get("expr", "")
+                    if expr and expr not in failed_list:
+                        failed_list.append(expr)
+                        log(f"  📝 Registered failed expr ({len(failed_list)} total): {expr[:60]}")
+                # Keep list bounded
+                if len(failed_list) > 100:
+                    self.state["failed_expressions"] = failed_list[-100:]
+                if self.state["stuck_batches"] >= 3:
+                    log(f"⚠️  {self.state['stuck_batches']} consecutive batches with 0 passes. "
+                        f"Switching to stuck mode (skip zero-occupancy fields).",
+                        "warn")
+            else:
+                # All candidates were quick_test skipped (S<1.0 or S=None)
+                # This means the generated pool is weak — still register and count
+                log(f"  ⚠️ Batch: all candidates quick_test skipped (weak signal pool), counting as stuck")
+                self.state["stuck_batches"] = self.state.get("stuck_batches", 0) + 1
+                failed_list = self.state.setdefault("failed_expressions", [])
+                for c in candidates:
+                    expr = c.get("expr", "")
+                    if expr and expr not in failed_list:
+                        failed_list.append(expr)
+                        log(f"  📝 Registered weak expr ({len(failed_list)} total): {expr[:60]}")
+                if len(failed_list) > 100:
+                    self.state["failed_expressions"] = failed_list[-100:]
+                if self.state["stuck_batches"] >= 3:
+                    log(f"⚠️  {self.state['stuck_batches']} consecutive batches with 0 passes. "
+                        f"Switching to stuck mode (skip zero-occupancy fields).",
+                        "warn")
 
         # ── Track meta-optimization counters ──
         self.state["batches_since_optimization"] = self.state.get("batches_since_optimization", 0) + 1
@@ -1695,13 +1844,18 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
     
     def _quick_test(self, cand: dict):
         """Quick 1-year sim to filter weak signals before full sim.
-        Returns: True (proceed), False (weak S), or "skip" (S=None/dead pair)."""
+        Returns: True (proceed), False (weak/invalid), or "skip" (S=None/dead pair).
+        
+        Conservative design: any failure in quick_test → conservative fail.
+        Full sim will still run for candidates that pass quick_test.
+        On transient errors (401/retry failed), return False to avoid wasting full sim time.
+        """
         payload = {"type": "REGULAR", "regular": cand["expr"], "settings": QUICK_SETTINGS}
         try:
             r = self.s.post(f"{API}/simulations", json=payload, timeout=60)
         except Exception as e:
             log(f"⏩ Quick test POST failed: {e}", "error")
-            return True  # pass through on error, let full sim decide
+            return False  # conservative: don't waste full sim time on unreachable
         if r.status_code == 401:
             log("⚠️ 401 on quick test POST, refreshing session...", "warn")
             self.s = fresh_session()
@@ -1710,10 +1864,10 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                 r = self.s.post(f"{API}/simulations", json=payload, timeout=60)
             except Exception as e:
                 log(f"⏩ Quick test retry POST failed: {e}", "error")
-                return True
+                return False  # conservative
         if r.status_code != 201:
             log(f"⏩ Quick test: HTTP {r.status_code}", "error")
-            return True
+            return False  # conservative
         sim_id = r.headers.get("Location", "").split("/")[-1]
 
         def quick_ready(data):
@@ -1726,8 +1880,8 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             initial_interval=10, fallback_interval=30,
         )
         if not alpha_id:
-            log(f"⏩ Quick test: timeout, pass through")
-            return True
+            log(f"⏩ Quick test: timeout, conservatively skip")
+            return False
         # Fetch IS stats
         r2 = self.s.get(f"{API}/alphas/{alpha_id}", timeout=30)
         if r2.status_code != 200:
@@ -1843,6 +1997,17 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
 
         log(f"📊 IS: S={cand['sharpe']} F={cand['fitness']} | {passes}P/{fails}F | {cand['is_status']}")
 
+        # ── RECORD: IS pass/fail ──
+        _wqdb.record_alpha_event(
+            name=cand.get("name", ""), expr=cand.get("expr", ""),
+            event_type="is_pass" if is_pass else ("is_tune" if soft_pass else "is_fail"),
+            alpha_id=alpha_id,
+            sharpe=cand.get("sharpe"),
+            fitness=cand.get("fitness"),
+            is_status=cand["is_status"],
+            phase="full_sim"
+        )
+
         if is_pass:
             notify(f"IS PASS ✅ {cand['name']}\nS={cand['sharpe']} F={cand['fitness']}\n{cand['expr'][:80]}",
                    emoji="✅", dedup_key=f"is_{cand.get('alpha_id','')}")
@@ -1915,12 +2080,12 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
         sc_result = adaptive_poll(
             self.s, f"{API}/alphas/{alpha_id}",
             f"SC {cand['name']}",
-            sc_ready, max_wait=3600,  # 1 hour max
+            sc_ready, max_wait=14400,  # 4h — WQ SC can take up to 4h on busy accounts
             initial_interval=30, fallback_interval=120
         )
         
         if not sc_result:
-            # Try 403 probe as fallback
+            # Try 403 probe as fallback — probe the alpha to get SC result
             try:
                 r3 = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
                 if r3.status_code == 401:
@@ -1932,9 +2097,14 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                     body = r3.json()
                     checks = body.get("is", {}).get("checks", []) if isinstance(body.get("is"), dict) else []
                     sc = next((c for c in checks if c["name"] == "SELF_CORRELATION"), None)
-                    if sc:
+                    if sc and sc.get("result") != "PENDING":
                         sc_result = sc
-            except: pass
+                    else:
+                        log(f"⚠️ 403 probe: SC still pending or no SC found")
+                else:
+                    log(f"⚠️ 403 probe: got HTTP {r3.status_code}, expected 403")
+            except Exception as e:
+                log(f"⚠️ 403 probe error: {e}")
         
         if not sc_result:
             cand["sc_result"] = "TIMEOUT"
@@ -1945,6 +2115,19 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
         is_pass = sc_result.get("result") == "PASS"
         
         log(f"📊 SC={cand['sc_value']} result={cand['sc_result']}")
+        
+        # ── RECORD: SC pass/fail ──
+        _wqdb.record_alpha_event(
+            name=cand.get("name", ""), expr=cand.get("expr", ""),
+            event_type="sc_pass" if is_pass else "sc_fail",
+            alpha_id=alpha_id,
+            sharpe=cand.get("sharpe"),
+            fitness=cand.get("fitness"),
+            sc_value=cand.get("sc_value"),
+            sc_result=cand.get("sc_result"),
+            phase="sc_submit"
+        )
+        
         if is_pass:
             notify(f"SC通过 ✅ {cand['name']}\nSC={cand['sc_value']}\n{cand['expr'][:60]}",
                    emoji="✅", dedup_key=f"sc_{cand.get('alpha_id','')}")
@@ -1978,6 +2161,18 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
         if r.status_code in (200, 201, 202):
             log(f"✅ Submitted! status={r.status_code}")
             cand["submitted"] = True
+            
+            # ── RECORD: Submitted ──
+            _wqdb.record_alpha_event(
+                name=cand["name"], expr=cand["expr"],
+                event_type="submitted",
+                alpha_id=alpha_id,
+                sharpe=cand.get("sharpe"),
+                fitness=cand.get("fitness"),
+                sc_value=cand.get("sc_value"),
+                phase="submit"
+            )
+            
             self.state["candidates_submitted"] = self.state.get("candidates_submitted", 0) + 1
             self.state["candidates_passed_is"] = self.state.get("candidates_passed_is", 0) + 1
             self.state["candidates_passed_sc"] = self.state.get("candidates_passed_sc", 0) + 1
@@ -2096,7 +2291,17 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
             if is_optimization and opt_strategy:
                 # ── Strategy-driven optimization variation generation ──
                 log(f"  📋 Using optimization strategy: {opt_strategy['description']}")
-                ratio_prefix = base_expr.rsplit("+", 1)[0] if "+" in base_expr else base_expr
+                
+                # Skeleton-aware prefix extraction
+                # Strip the last +/-W*{momentum} term from the expression
+                # MULT:  rank(A/B)*rank(C/D)+W*rank(mom)    → prefix=rank(A/B)*rank(C/D)
+                # DIRECT_RANK: rank(field)-W*rank(mom)       → prefix=rank(field)
+                # THREE_TERM:  rank(A/B)+rank(C/D)-W*rank(X) → prefix=rank(A/B)+rank(C/D)
+                # IND_NEUT: ind_neutral(...)+W*rank(field/eq)→ prefix=ind_neutral(...)
+                expr_stripped = re.sub(r'[+-]\d+\.?\d*\*?(?:rank\([^)]+\)|ts_\w+\([^)]*\))', '', base_expr).strip()
+                # Only use regex prefix if it actually stripped something
+                ratio_prefix = expr_stripped if expr_stripped != base_expr else base_expr
+                
                 gen_count = 0
                 for new_w in opt_strategy["weights"]:
                     for idx, mom_name in enumerate(opt_strategy["mom_fields"]):
@@ -2135,9 +2340,10 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                 ]
                 # NOTE: "rank(ts_std(returns,5))" removed — always stalls at 0% on WQ engine
                 
-                # Extract the ratio prefix (everything before the last +)
-                # Base format: ratio1*ratio2+W*rank(momentum)
-                ratio_prefix = base_expr.rsplit("+", 1)[0] if "+" in base_expr else base_expr
+                # Extract the ratio prefix (everything before the last weight*momentum term)
+                # Skeleton-aware: handles MULT (uses +), DIRECT_RANK (uses -), THREE_TERM (uses +...-)
+                expr_stripped = re.sub(r'[+-]\d+\.?\d*\*?(?:rank\([^)]+\)|ts_\w+\([^)]*\))', '', base_expr).strip()
+                ratio_prefix = expr_stripped if expr_stripped != base_expr else base_expr
                 
                 for new_w in [0.3, 0.5, 0.7, 0.9]:
                     for (mom, mom_name) in mom_variants:
@@ -2261,12 +2467,36 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                 except:
                     continue
             
-            if r.status_code != 201:
+            # Handle 409: sim already exists (same expression submitted recently)
+            # Try to continue polling the existing sim rather than skipping
+            if r.status_code == 409:
+                existing_sim_id = None
+                try:
+                    err_body = r.json()
+                    # WQ often includes the sim URL in a 'path' field or Location
+                    if "path" in err_body:
+                        existing_sim_id = err_body["path"].split("/")[-1]
+                    elif "target" in err_body:
+                        existing_sim_id = err_body["target"].split("/")[-1]
+                except:
+                    pass
+                if existing_sim_id:
+                    log(f"    ⚠️ 409: sim already exists (sim_id={existing_sim_id}), reusing")
+                    var["sim_id"] = existing_sim_id
+                    # Fall through to the polling section below
+                else:
+                    log(f"    ⚠️ 409: sim exists but couldn't extract sim_id, skipping")
+                    continue
+            
+            elif r.status_code != 201:
                 log(f"    ❌ HTTP {r.status_code}")
                 continue
             
-            sim_id = r.headers.get("Location", "").split("/")[-1]
-            var["sim_id"] = sim_id
+            if var.get("sim_id"):
+                sim_id = var["sim_id"]
+            else:
+                sim_id = r.headers.get("Location", "").split("/")[-1]
+                var["sim_id"] = sim_id
             
             # Adaptive IS poll
             def is_ready(data):
@@ -2345,6 +2575,17 @@ IS {cand.get('sharpe','?')}/{cand.get('fitness','?')}，调参重试后仍失败
                         "expr": var["expr"],
                         "name": var["name"],
                     }
+                    # ── RECORD: optimized variant ──
+                    _wqdb.record_alpha_event(
+                        name=var["name"], expr=var["expr"],
+                        event_type="optimized",
+                        alpha_id=alpha_id,
+                        sharpe=var["sharpe"],
+                        fitness=var["fitness"],
+                        is_status="OPT_BEST",
+                        phase="full_sim",
+                        notes=f"Optimization: new best S={var_sharpe:.2f}"
+                    )
                     log(f"    📈 New best optimization variant: S={var_sharpe:.2f}")
                 continue  # Test remaining variations
             
