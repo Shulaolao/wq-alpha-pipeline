@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 
 # Add scripts dir for wq_db import
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+_SCRIPT_DIR = Path(os.environ.get("WQ_SCRIPTS_DIR", Path.home() / ".hermes" / "scripts"))
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 import wq_db
 
 app = Flask(__name__)
@@ -466,6 +468,56 @@ def api_warnings():
             "total": len(warns),
             "entries": warns,
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── Alpha History & Submitted ──────────────────────────────────────
+
+@app.route("/api/alphas/history")
+def api_alphas_history():
+    """Get alpha event history from SQLite."""
+    try:
+        limit = int(request.args.get("limit", 200))
+        offset = int(request.args.get("offset", 0))
+        data = wq_db.get_all_alpha_history(limit=limit, offset=offset)
+        # Rename "events" key to "alphas" for frontend compat
+        return jsonify({
+            "total": data["total"],
+            "alphas": data["events"],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/alphas/submitted")
+def api_alphas_submitted():
+    """Get all submitted alphas with IS/SC metrics."""
+    try:
+        alphas = wq_db.get_submitted_alphas()
+        return jsonify({
+            "total": len(alphas),
+            "alphas": alphas,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/improvements")
+def api_improvements():
+    """Get alpha improvements (IS→SC→optimized records) from SQLite."""
+    try:
+        # Query: alphas where IS pass but SC fail, then later SC pass
+        conn = wq_db.get_db()
+        try:
+            rows = conn.execute(
+                """SELECT name, expr, event_type, sharpe, fitness, sc_value, sc_result, created_at
+                   FROM alpha_events
+                   WHERE event_type IN ('sc_pass', 'sc_fail', 'is_pass', 'optimized')
+                   ORDER BY created_at DESC
+                   LIMIT 50"""
+            ).fetchall()
+            improvements = [dict(r) for r in rows]
+            return jsonify({"total": len(improvements), "improvements": improvements})
+        finally:
+            conn.close()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

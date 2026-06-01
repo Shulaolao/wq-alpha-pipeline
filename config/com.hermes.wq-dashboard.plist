@@ -7,14 +7,14 @@
     <key>ProgramArguments</key>
     <array>
         <string>/opt/anaconda3/bin/python3</string>
-        <string>/Users/asdd/wq-dashboard/server.py</string>
+        <string>/Users/asdd/projects/wq-alpha-pipeline/dashboard/server.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/asdd/wq-dashboard</string>
+    <string>/Users/asdd/projects/wq-alpha-pipeline/dashboard</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <false/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
