@@ -528,13 +528,14 @@ def api_alphas_submitted():
 
 @app.route("/api/improvements")
 def api_improvements():
-    """Get alpha improvements (IS→SC→optimized records) from SQLite."""
-    # Also try JSON log file for meta-optimization records
-    IMPROVEMENT_JSON = HOME / ".wq_improvement_log.json"
-    improvement_json = read_json_safe(IMPROVEMENT_JSON)
-    
+    """Get self-evolution improvement records from SQLite.
+    Also returns SQLite alpha_events as 'improvements' for backward compat."""
     try:
-        # Query: alphas where IS pass but SC fail, then later SC pass
+        # Primary: read from improvements table
+        improvements_db = wq_db.get_improvements(limit=50)
+        total = wq_db.count_improvements()
+
+        # Also query alpha_events for IS/SC timeline
         conn = wq_db.get_db()
         try:
             rows = conn.execute(
@@ -544,33 +545,16 @@ def api_improvements():
                    ORDER BY created_at DESC
                    LIMIT 50"""
             ).fetchall()
-            improvements = [dict(r) for r in rows]
+            alpha_events = [dict(r) for r in rows]
         finally:
             conn.close()
-        
-        # If JSON file has meta-optimization records, return them as 'records'
-        # SQLite results as 'improvements' for backward compat
-        if isinstance(improvement_json, list) and len(improvement_json) > 0:
-            # Sort newest first
-            sorted_records = sorted(improvement_json, key=lambda r: r.get("timestamp", ""), reverse=True)
-            return jsonify({
-                "total": len(sorted_records),
-                "records": sorted_records,
-                "improvements": improvements,
-            })
-        else:
-            return jsonify({
-                "total": len(improvements),
-                "improvements": improvements,
-            })
+
+        return jsonify({
+            "total": total,
+            "records": improvements_db,
+            "improvements": alpha_events,
+        })
     except Exception as e:
-        # Fallback to JSON file if SQLite fails
-        if isinstance(improvement_json, list) and len(improvement_json) > 0:
-            sorted_records = sorted(improvement_json, key=lambda r: r.get("timestamp", ""), reverse=True)
-            return jsonify({
-                "total": len(sorted_records),
-                "records": sorted_records,
-            })
         return jsonify({"error": str(e)}), 500
 
 # ─── Serve Legacy HTML (keep for compat) ───────────────────────────────

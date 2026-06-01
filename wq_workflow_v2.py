@@ -26,7 +26,9 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 # ═══ Auto-load .env from home directory ═══
-_env_path = Path.home() / ".hermes" / ".env"
+# ⚠️ MUST use os.path.expanduser() not Path.home() — launchd does NOT set HOME env var
+# Path.home() would return '/' under launchd, loading /root/.hermes/.env (nonexistent)
+_env_path = Path(os.path.expanduser("~/.hermes/.env"))
 if _env_path.exists():
     with open(_env_path) as _f:
         for _line in _f:
@@ -48,8 +50,12 @@ class _TLSAdapter(requests.adapters.HTTPAdapter):
 
 # ═══ Configuration ═══════════════════════════════════
 API = "https://api.worldquantbrain.com"
-EMAIL = os.environ.get("WQ_EMAIL", "shufengln@gmail.com")
-PASS = os.environ.get("WQ_PASS", "123321sf")
+EMAIL = os.environ.get("WQ_EMAIL")
+if not EMAIL:
+    raise EnvironmentError("WQ_EMAIL not set. Set via .env or export WQ_EMAIL=...")
+PASS = os.environ.get("WQ_PASS")
+if not PASS:
+    raise EnvironmentError("WQ_PASS not set. Set via .env or export WQ_PASS=...")
 HOME = Path.home()
 STATE_FILE = HOME / ".wq_workflow_v2.json"
 LOG_FILE = HOME / ".wq_workflow_v2.log"
