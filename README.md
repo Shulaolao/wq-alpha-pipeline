@@ -168,8 +168,9 @@ wq-alpha-pipeline/
 │   ├── P7(2026-06-01): SC 轮询超时 1h→4h，匹配繁忙账户 SC 排队时长
 │   ├── P8(2026-06-01): SC 403 fallback 死代码修复 — 非 403 不调 json()，显式 Exception 捕获
 │   ├── P9(2026-06-01): tune sim POST 409 幂等性 — 重复表达式检测后复用现有 sim_id 继续轮询
-│   ├── P10(2026-06-01): ratio_prefix 骨架感知提取 — regex 替代 rsplit(+)，DIRECT_RANK/THREE_TERM 不再生成畸形表达式
-│   └── P11(2026-06-01): adaptive_poll 卡死检测升级 — 任意进度停滞（35%/15% 也触发），不限于 0%
+│   ├── P10(2026-06-01): ratio_prefix 骨架感知提取 — _strip_last_term() 逆序字符解析替代 rsplit(+)，DIRECT_RANK/THREE_TERM 不再生成畸形表达式
+│   ├── P11(2026-06-01): adaptive_poll 卡死检测升级 — 任意进度停滞（35%/15% 也触发），不限于 0%
+│   └── P12(2026-06-02): _strip_last_term 改用 paren-depth 逆序扫描，修复 regex `[^)]+` 无法处理 ts_corr 嵌套括号的 bug
 ├── scripts/
 │   └── wq_pipeline.py              # 旧版三阶段流水线（已废弃）
 ├── config/

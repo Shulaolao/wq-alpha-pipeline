@@ -529,6 +529,10 @@ def api_alphas_submitted():
 @app.route("/api/improvements")
 def api_improvements():
     """Get alpha improvements (IS→SC→optimized records) from SQLite."""
+    # Also try JSON log file for meta-optimization records
+    IMPROVEMENT_JSON = HOME / ".wq_improvement_log.json"
+    improvement_json = read_json_safe(IMPROVEMENT_JSON)
+    
     try:
         # Query: alphas where IS pass but SC fail, then later SC pass
         conn = wq_db.get_db()
@@ -541,10 +545,32 @@ def api_improvements():
                    LIMIT 50"""
             ).fetchall()
             improvements = [dict(r) for r in rows]
-            return jsonify({"total": len(improvements), "improvements": improvements})
         finally:
             conn.close()
+        
+        # If JSON file has meta-optimization records, return them as 'records'
+        # SQLite results as 'improvements' for backward compat
+        if isinstance(improvement_json, list) and len(improvement_json) > 0:
+            # Sort newest first
+            sorted_records = sorted(improvement_json, key=lambda r: r.get("timestamp", ""), reverse=True)
+            return jsonify({
+                "total": len(sorted_records),
+                "records": sorted_records,
+                "improvements": improvements,
+            })
+        else:
+            return jsonify({
+                "total": len(improvements),
+                "improvements": improvements,
+            })
     except Exception as e:
+        # Fallback to JSON file if SQLite fails
+        if isinstance(improvement_json, list) and len(improvement_json) > 0:
+            sorted_records = sorted(improvement_json, key=lambda r: r.get("timestamp", ""), reverse=True)
+            return jsonify({
+                "total": len(sorted_records),
+                "records": sorted_records,
+            })
         return jsonify({"error": str(e)}), 500
 
 # ─── Serve Legacy HTML (keep for compat) ───────────────────────────────

@@ -1385,6 +1385,31 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     
     return result
 
+def _strip_last_term(expr: str) -> str:
+    """Strip the last +/-W*{momentum} term from an expression.
+    
+    Uses reverse scan with paren-depth tracking to handle nested parens
+    like ts_corr(close,volume,10) — regex can't handle this correctly.
+    
+    Examples:
+        rank(A/B)*rank(C/D)+0.7*rank(ts_mean(volume,5))
+            → rank(A/B)*rank(C/D)
+        rank(debt)-1.0*rank(returns)
+            → rank(debt)
+        rank(A/B)+rank(C/D)-0.5*rank(ts_corr(close,volume,10))
+            → rank(A/B)+rank(C/D)
+    """
+    depth = 0
+    for i in range(len(expr) - 1, -1, -1):
+        if expr[i] == ')':
+            depth += 1
+        elif expr[i] == '(':
+            depth -= 1
+        elif depth == 0 and expr[i] in '+-':
+            # Found the last top-level +/- operator
+            return expr[:i].strip()
+    return expr
+
 # ═══ ADAPTIVE POLLING ════════════════════════════
 def adaptive_poll(session, url: str, poll_name: str,
                    success_condition, max_wait: int = 1800,
@@ -2292,13 +2317,14 @@ class Workflow:
                 # ── Strategy-driven optimization variation generation ──
                 log(f"  📋 Using optimization strategy: {opt_strategy['description']}")
                 
-                # Skeleton-aware prefix extraction
+                # Skeleton-aware prefix extraction (robust: handles nested parens)
                 # Strip the last +/-W*{momentum} term from the expression
                 # MULT:  rank(A/B)*rank(C/D)+W*rank(mom)    → prefix=rank(A/B)*rank(C/D)
                 # DIRECT_RANK: rank(field)-W*rank(mom)       → prefix=rank(field)
                 # THREE_TERM:  rank(A/B)+rank(C/D)-W*rank(X) → prefix=rank(A/B)+rank(C/D)
-                # IND_NEUT: ind_neutral(...)+W*rank(field/eq)→ prefix=ind_neutral(...)
-                expr_stripped = re.sub(r'[+-]\d+\.?\d*\*?(?:rank\([^)]+\)|ts_\w+\([^)]*\))', '', base_expr).strip()
+                # IND_NEUT: ind_neutral(...)+W*rank(field)   → prefix=ind_neutral(...)
+                # Uses reverse scan with paren-depth tracking, regex can't handle nested parens
+                expr_stripped = _strip_last_term(base_expr)
                 # Only use regex prefix if it actually stripped something
                 ratio_prefix = expr_stripped if expr_stripped != base_expr else base_expr
                 
@@ -2342,7 +2368,8 @@ class Workflow:
                 
                 # Extract the ratio prefix (everything before the last weight*momentum term)
                 # Skeleton-aware: handles MULT (uses +), DIRECT_RANK (uses -), THREE_TERM (uses +...-)
-                expr_stripped = re.sub(r'[+-]\d+\.?\d*\*?(?:rank\([^)]+\)|ts_\w+\([^)]*\))', '', base_expr).strip()
+                # Uses paren-depth reverse scan — regex can't handle nested parens like ts_corr
+                expr_stripped = _strip_last_term(base_expr)
                 ratio_prefix = expr_stripped if expr_stripped != base_expr else base_expr
                 
                 for new_w in [0.3, 0.5, 0.7, 0.9]:
