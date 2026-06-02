@@ -5,6 +5,7 @@ import type { PipelineStatus } from '@/types/dashboard';
 import type { HistoryEvent, AlphaSummary } from '@/services/api';
 import { fetchStatus, fetchHistory, fetchOrthogonality, fetchCompleteAlphas } from '@/services/api';
 import Header from '@/components/Header';
+import PipelineVisualizer from '@/components/PipelineVisualizer';
 import WorkflowGraph from '@/components/WorkflowGraph';
 import PipelineStats from '@/components/PipelineStats';
 import CandidateCard from '@/components/CandidateCard';
@@ -79,7 +80,10 @@ export default function DashboardPage() {
         onRefreshIntervalChange={setRefreshMs}
       />
 
-      {/* Pipeline Visualizer */}
+      {/* Pipeline Visualizer — linear progress bar (always visible at top) */}
+      <PipelineVisualizer phase={status?.phase || 'init'} />
+
+      {/* WorkflowGraph — collapsible, shows rectangular loop when expanded */}
       <WorkflowGraph
         phase={status?.phase || 'init'}
         activeCount={status?.active_count}
