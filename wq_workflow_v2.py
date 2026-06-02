@@ -220,6 +220,11 @@ def _normalize_quad_key(quad) -> str:
 PV1_FIELDS = {"close", "volume", "adv20", "returns", "vwap", "open", "high", "low"}
 FUND_FIELDS = {"revenue", "enterprise_value", "debt", "equity", "operating_income", "ebitda", "cap", "cash", "sales"}
 
+# WQ neutralization dimensions — tried in gradient order for SC fail degradation.
+# INDUSTRY (current default) is coarsest; SECTOR/SubINDUSTRY peel finer layers,
+# reducing pseudo-correlation in SELF_CORRELATION checks.
+NEUTRALIZATION_DIMS = ["INDUSTRY", "SECTOR", "SUBINDUSTRY"]
+
 # AST structure skeleton types (for collision detection)
 # Same-skeleton over-use triggers WQ low-correlation penalty
 SKELETON_MULT = "mult_ratio"       # rank(A/B)*rank(C/D) + W*rank(M)
@@ -230,6 +235,16 @@ SKELETON_DIRECT_RANK = "direct_rank"  # rank(A) +/- rank(B) — no ratio
 SKELETON_THREE_TERM = "three_term" # rank(A/B) + rank(C/D) - rank(ts_*(X,N))
 SKELETON_IND_NEUT = "ind_neut"     # ind_neutral(rank(ts_*(X))) + rank(fund_ratio)
 SKELETON_SINGLE = "single"         # single factor: rank(ts_rank(X,N))
+
+# v3 Advanced Skeletons (directions A-D)
+SKELETON_CROSS_GATE = "cross_gate"       # A: 跨域条件门控 rank(pv1_signal)*sign(ts_delta(fund,N))
+SKELETON_DEEP_CASCADE = "deep_cascade"   # B: 深度嵌套 ts_rank(ts_corr(rank(A),rank(B),N),M)
+SKELETON_NONLINEAR_BREAKER = "nonlinear_breaker"  # C: 非线性 ts_argmax/close, N)*sign(ts_delta(ratio,N))
+SKELETON_TSRANK_CORR = "tsrank_corr"     # B: ts_rank(ts_corr(rank(A),rank(B),N1),N2)
+SKELETON_SIGN_SWITCH = "sign_switch"     # C: sign(ts_delta(close,N)) * rank(fund_ratio)
+SKELETON_TREND_BREAK = "trend_break"     # C: ts_argmax(volume,N)/ts_argmax(volume,2N) * rank(close/money)
+SKELETON_VOL_ADJ = "vol_adj"             # C: rank(close/volume) / ts_std(returns,N)
+SKELETON_RESIDUAL = "residual"           # B: ts_rank(ts_residual(close,returns,N),M)
 
 # Proven field pairs (verified by IS PASS history in this account)
 VERIFIED_NUM_DEN_PAIRS = [
@@ -303,6 +318,11 @@ def load_state() -> dict:
         "stuck_batches": 0,
         "batches_since_optimization": 0,
         "last_optimization_at": None,
+        # ── v3.19 Skeleton Popularity Tracking ──
+        # Tracks per-skeleton type: success rates, avg sharpe, SC pass rate
+        # Decayed each batch to favor recent performance
+        "skeleton_popularity": {},
+        "skeleton_popularity_decay": 1.0,  # multiplier applied each batch
     }
 
 def save_state(state: dict):
@@ -1381,6 +1401,208 @@ def _generate_ratio_lag_candidates(ortho: dict, active_exprs: list) -> list:
     return candidates
 
 
+# ═══ v3.19 NEW ADVANCED SKELETON GENERATORS ═══════════════
+# These implement 4 of the 7 advanced skeletons defined as constants
+# but never generated: sign_switch, vol_adj, deep_cascade, cross_gate.
+# Each has at least one ts_* operator (S≠None guarantee).
+# Each uses only proven field pairs (no ebitda/cash/sales ratios).
+
+
+def _generate_sign_switch_candidates(ortho: dict, active_exprs: list) -> list:
+    """Pattern C: sign_switch — sign(ts_delta(close,N)) * rank(fund_ratio)
+    
+    Captures: directional price change * fundamental value.
+    sign(ts_delta) provides binary +1/-1 switch for price momentum direction.
+    Multiplying by a fundamental ratio ranks creates a conditional value signal.
+    ts_delta provides the time-series component → S≠None guaranteed.
+    """
+    candidates = []
+    fund_ratios = [
+        ("revenue/enterprise_value", "rev_ev"),
+        ("debt/equity", "de"),
+        ("revenue/cap", "rev_cap"),
+        ("operating_income/cap", "oi_cap"),
+        ("debt/enterprise_value", "de_ev"),
+        ("revenue/equity", "rev_eq"),
+        ("operating_income/equity", "oi_eq"),
+    ]
+    # ts_delta windows: short (5d), medium (10d), long (20d)
+    delta_windows = [
+        ("ts_delta(close,5)", "dcl5"),
+        ("ts_delta(close,10)", "dcl10"),
+        ("ts_delta(close,20)", "dcl20"),
+        ("-1*ts_delta(close,5)", "neg_dcl5"),
+        ("-1*ts_delta(close,10)", "neg_dcl10"),
+        ("ts_delta(high,5)", "dhi5"),
+        ("ts_delta(volume,5)", "dvol5"),
+    ]
+    seen = set()
+    for (ratio_str, ratio_name) in fund_ratios:
+        for (delta_str, delta_name) in delta_windows:
+            # sign + ts_delta = ts_ operator present → S≠None
+            expr = f"sign({delta_str})*rank({ratio_str})"
+            if expr in seen or expr in active_exprs:
+                continue
+            seen.add(expr)
+            score = score_candidate_orthogonality(expr, ortho, active_exprs)
+            name = f"SS_{delta_name}_{ratio_name}"[:40]
+            name = name.replace("-","_").replace(" ","")
+            candidates.append({
+                "name": name, "expr": expr,
+                "orthogonality_score": score,
+                "skeleton": SKELETON_SIGN_SWITCH,
+            })
+    candidates.sort(key=lambda x: -x["orthogonality_score"])
+    return candidates
+
+
+def _generate_vol_adj_candidates(ortho: dict, active_exprs: list) -> list:
+    """Pattern: vol_adj — rank(ts_corr(X,Y,N)) + W*rank(fund_ratio)
+    
+    Volatility-adjusted signal: price-volume correlation + fundamental ratio.
+    ts_corr provides the time-series component. The correlation itself captures
+    market regime (trending vs choppy), while the ratio adds fundamental value.
+    No actual division by ts_std (which risks S=None), so the name reflects
+    that this is a volatility-aware structural pattern.
+    """
+    candidates = []
+    # Correlation signals: price-volume, price-volatility
+    corr_signals = [
+        ("ts_corr(close,volume,10)", "cv10"),
+        ("ts_corr(close,volume,20)", "cv20"),
+        ("ts_corr(close,volume,40)", "cv40"),
+        ("ts_corr(close,returns,10)", "cr10"),
+        ("ts_corr(close,returns,20)", "cr20"),
+        ("ts_corr(volume,returns,10)", "vr10"),
+        ("ts_corr(close,adv20,20)", "ca20"),
+    ]
+    fund_ratios = [
+        ("revenue/enterprise_value", "rev_ev"),
+        ("debt/equity", "de"),
+        ("revenue/cap", "rev_cap"),
+        ("operating_income/cap", "oi_cap"),
+        ("revenue/equity", "rev_eq"),
+    ]
+    seen = set()
+    for (corr_str, corr_name) in corr_signals:
+        for (ratio_str, ratio_name) in fund_ratios:
+            for w in [0.5, 0.7]:
+                expr = f"rank({corr_str})+{w}*rank({ratio_str})"
+                if expr in seen or expr in active_exprs:
+                    continue
+                seen.add(expr)
+                score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                name = f"VA_{corr_name}_{ratio_name}_w{int(w*10)}"[:40]
+                name = name.replace("-","_").replace(" ","")
+                candidates.append({
+                    "name": name, "expr": expr,
+                    "orthogonality_score": score,
+                    "skeleton": SKELETON_VOL_ADJ,
+                    "weight": w,
+                })
+    candidates.sort(key=lambda x: -x["orthogonality_score"])
+    return candidates
+
+
+def _generate_deep_cascade_candidates(ortho: dict, active_exprs: list) -> list:
+    """Pattern B: deep_cascade — ts_rank(ts_corr(rank(fund), rank(pv1), N1), N2)
+    
+    Deep nested signal: rank a long-term correlation between fundamental
+    ranking and price signal. Minimal field usage (2 fields).
+    No ratio pair → zero S=None risk.
+    Pattern: ts_rank(ts_corr(rank({{fund}}), rank({{pv1}}), {{window}}), {{rank_window}})
+    """
+    candidates = []
+    fund_fields = ["revenue", "debt", "cap", "enterprise_value", "equity", "operating_income"]
+    pv1_fields_signal = ["returns", "volume", "adv20", "close"]
+    # Correlation windows: medium and long
+    corr_windows = [20, 40, 60, 120]
+    rank_windows = [60, 120, 250]
+    seen = set()
+    for fund in fund_fields:
+        for pv1 in pv1_fields_signal:
+            if pv1 == "returns" and fund == "cap":
+                # Special case: duplicate of existing DIRECT_RANK variants
+                # but the wrapper structure is different
+                pass  # include it — structure differs from DR
+            for cw in corr_windows:
+                for rw in rank_windows:
+                    expr = f"ts_rank(ts_corr(rank({fund}),rank({pv1}),{cw}),{rw})"
+                    if expr in seen or expr in active_exprs:
+                        continue
+                    seen.add(expr)
+                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                    name = f"DC_{fund[:3]}_{pv1[:3]}_c{cw}_r{rw}"[:40]
+                    name = name.replace("-","_").replace(" ","")
+                    candidates.append({
+                        "name": name, "expr": expr,
+                        "orthogonality_score": score,
+                        "skeleton": SKELETON_DEEP_CASCADE,
+                        "corr_window": cw,
+                        "rank_window": rw,
+                    })
+    # Dedup by expression and sort
+    seen_exprs = set()
+    deduped = []
+    for c in candidates:
+        if c["expr"] in seen_exprs:
+            continue
+        seen_exprs.add(c["expr"])
+        deduped.append(c)
+    deduped.sort(key=lambda x: -x["orthogonology_score"])
+    return deduped
+
+
+def _generate_cross_gate_candidates(ortho: dict, active_exprs: list) -> list:
+    """Pattern A: cross_gate — rank(ts_delta(pv1,N)) + sign(ts_delta(fund_ratio,N))
+    
+    Cross-domain conditional gating: price momentum + fundamental change direction.
+    ts_delta on price side provides the magnitude signal.
+    sign(ts_delta(fund_ratio)) provides the fundamental direction gate.
+    Two ts_ operators guarantee S≠None.
+    """
+    candidates = []
+    # Price signals (magnitude)
+    price_signals = [
+        ("ts_delta(close,5)", "dcl5"),
+        ("ts_delta(close,10)", "dcl10"),
+        ("ts_delta(close,20)", "dcl20"),
+        ("ts_mean(returns,5)", "mret5"),
+        ("ts_mean(returns,10)", "mret10"),
+        ("ts_delta(volume,5)", "dvol5"),
+    ]
+    # Fundamental ratios (for sign(gate))
+    fund_ratios = [
+        ("revenue/enterprise_value", "rev_ev"),
+        ("debt/equity", "de"),
+        ("revenue/cap", "rev_cap"),
+        ("operating_income/cap", "oi_cap"),
+        ("debt/enterprise_value", "de_ev"),
+    ]
+    # Gate windows for fundamental delta
+    gate_periods = [5, 10, 20]
+    seen = set()
+    for (psig_str, psig_name) in price_signals:
+        for (ratio_str, ratio_name) in fund_ratios:
+            for gp in gate_periods:
+                # Gate: sign(ts_delta(fund_ratio, N)) → binary +1/-1 direction
+                expr = f"rank({psig_str})+sign(ts_delta({ratio_str},{gp}))"
+                if expr in seen or expr in active_exprs:
+                    continue
+                seen.add(expr)
+                score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                name = f"CG_{psig_name}_{ratio_name}_g{gp}"[:40]
+                name = name.replace("-","_").replace(" ","")
+                candidates.append({
+                    "name": name, "expr": expr,
+                    "orthogonality_score": score,
+                    "skeleton": SKELETON_CROSS_GATE,
+                    "gate_period": gp,
+                })
+    candidates.sort(key=lambda x: -x["orthogonality_score"])
+    return candidates
+
+
 def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
                         failed_exprs: list = None, stuck_batches: int = 0) -> list:
     """
@@ -1672,9 +1894,123 @@ def _strip_last_term(expr: str) -> str:
             return expr[:i].strip()
     return expr
 
+
+# ═══ STRUCTURAL DISTANCE MATRIX ═══════════════════
+# Direction D: 主动熵增调度 — 结构距离矩阵驱动的骨架探索
+
+_CLASSIFIER_PATTERNS = [
+    (re.compile(r'rank\([^)]+/\)[^)]*\*[^)]*rank\([^)]+/\)'), SKELETON_CROSS_GATE, "cross_gate"),
+    (re.compile(r'ts_rank\s*\(\s*ts_corr'), SKELETON_TSRANK_CORR, "tsrank_corr"),
+    (re.compile(r'\bsign\s*\(\s*ts_delta'), SKELETON_SIGN_SWITCH, "sign_switch"),
+    (re.compile(r'ts_argmax[^)]*ts_argmin|ts_argmin[^)]*ts_argmax'), SKELETON_TREND_BREAK, "trend_break"),
+    (re.compile(r'\bts_argmax\('), SKELETON_NONLINEAR_BREAKER, "nonlinear_breaker"),
+    (re.compile(r'\bts_argmin\('), SKELETON_NONLINEAR_BREAKER, "nonlinear_breaker"),
+    (re.compile(r'rank\s*\([^)]+\)\s*/\s*ts_std'), SKELETON_VOL_ADJ, "vol_adj"),
+    (re.compile(r'ts_corr\s*\(\s*rank'), SKELETON_DEEP_CASCADE, "deep_cascade"),
+]
+
+def _classify_v3_skeleton(expr: str) -> str:
+    """v3: Classify expression into skeleton type using v3 pattern set."""
+    for pat, skeleton, short in _CLASSIFIER_PATTERNS:
+        if pat.search(expr):
+            return short
+    return _get_skeleton_type(expr)
+
+
+class StructuralDistanceMatrix:
+    """骨架结构距离矩阵 — 衡量两个表达式的 AST 拓扑相似度。
+    相似度 > threshold 的骨架被硬裁剪，防止探索陷入局部拓扑陷阱。
+    """
+
+    def __init__(self):
+        self._cache: Dict[str, dict] = {}
+
+    def extract_features(self, expr: str) -> dict:
+        """从表达式提取结构化特征向量。"""
+        if expr in self._cache:
+            return self._cache[expr]
+        feats: Dict[str, Any] = {}
+        ops = ['rank', 'ts_mean', 'ts_sum', 'ts_std', 'ts_corr', 'ts_rank',
+               'ts_min', 'ts_max', 'ts_argmin', 'ts_argmax', 'ts_zscore',
+               'ts_delta', 'ts_trend', 'ts_percentile', 'log', 'sign', 'abs',
+               'ind_neutral', 'ts_cov']
+        feats['op_counts'] = {op: len(re.findall(r'\b' + op + r'\(', expr)) for op in ops}
+        feats['total_ops'] = sum(feats['op_counts'].values())
+        depth = max_depth = 0
+        for ch in expr:
+            if ch == '(':
+                depth += 1
+                max_depth = max(max_depth, depth)
+            elif ch == ')':
+                depth -= 1
+        feats['max_nesting'] = max_depth
+        n_ts = sum(1 for op in ops if op.startswith('ts_') and op + '(' in expr)
+        feats['ts_ratio'] = n_ts / max(feats['total_ops'], 1)
+        fields = set(FIELD_PATTERN.findall(expr))
+        feats['has_pv1'] = bool(fields & PV1_FIELDS)
+        feats['has_fund'] = bool(fields & FUND_FIELDS)
+        feats['cross_domain'] = feats['has_pv1'] and feats['has_fund']
+        feats['has_sign'] = bool(re.search(r'\bsign\(', expr))
+        feats['has_abs'] = bool(re.search(r'\babs\(', expr))
+        feats['has_argmax'] = 'ts_argmax(' in expr
+        feats['has_argmin'] = 'ts_argmin(' in expr
+        feats['has_corr'] = 'ts_corr(' in expr
+        feats['has_cov'] = 'ts_cov(' in expr
+        feats['ratio_count'] = len(RATIO_PATTERN_STRICT.findall(expr))
+        feats['mul_count'] = expr.count('*')
+        feats['n_rank'] = feats['op_counts']['rank']
+        self._cache[expr] = feats
+        return feats
+
+    def structural_similarity(self, expr1: str, expr2: str) -> float:
+        """计算结构相似度 [0, 1]。0=完全不同, 1=完全相同结构。"""
+        f1 = self.extract_features(expr1)
+        f2 = self.extract_features(expr2)
+        sims = []
+        s1 = {op for op, c in f1['op_counts'].items() if c > 0}
+        s2 = {op for op, c in f2['op_counts'].items() if c > 0}
+        if s1 or s2:
+            sims.append(len(s1 & s2) / len(s1 | s2))
+        else:
+            sims.append(1.0)
+        md1, md2 = max(f1['max_nesting'], 1), max(f2['max_nesting'], 1)
+        sims.append(1 - abs(f1['max_nesting'] - f2['max_nesting']) / max(md1, md2))
+        sims.append(1 - abs(f1['ts_ratio'] - f2['ts_ratio']))
+        rc1, rc2 = max(f1['ratio_count'], 1), max(f2['ratio_count'], 1)
+        sims.append(1 - abs(f1['ratio_count'] - f2['ratio_count']) / max(rc1, rc2))
+        mc1, mc2 = max(f1['mul_count'], 1), max(f2['mul_count'], 1)
+        sims.append(1 - abs(f1['mul_count'] - f2['mul_count']) / max(mc1, mc2))
+        sims.append(1.0 if f1['cross_domain'] == f2['cross_domain'] else 0.0)
+        nl_keys = ['has_sign', 'has_abs', 'has_argmax', 'has_argmin', 'has_corr', 'has_cov']
+        nl_s = sum(1 for k in nl_keys if f1[k] == f2[k])
+        sims.append(nl_s / len(nl_keys))
+        return sum(sims) / len(sims)
+
+    def is_too_similar(self, expr: str, known_exprs: List[str], threshold: float = 0.45) -> bool:
+        """检查新表达式是否和已有表达式结构太相似。"""
+        for existing in known_exprs:
+            if self.structural_similarity(expr, existing) > threshold:
+                return True
+        return False
+
+    def get_diversity_score(self, exprs: List[str]) -> float:
+        """计算表达式集合的整体多样性分数 [0, 1]。"""
+        if len(exprs) < 2:
+            return 1.0
+        avg_sim = 0.0
+        count = 0
+        for i in range(len(exprs)):
+            for j in range(i + 1, len(exprs)):
+                avg_sim += self.structural_similarity(exprs[i], exprs[j])
+                count += 1
+        if count == 0:
+            return 1.0
+        return 1.0 - (avg_sim / count)
+
+
 # ═══ ADAPTIVE POLLING ════════════════════════════
 def adaptive_poll(session, url: str, poll_name: str,
-                   success_condition, max_wait: int = 1800,
+                  success_condition, max_wait: int = 1800,
                    initial_interval: float = 10,
                    fallback_interval: float = 60,
                    stuck_threshold: int = 0) -> Tuple[Optional[Any], requests.Session]:
@@ -2662,6 +2998,172 @@ class Workflow:
         else:
             log(f"❌ Submit: HTTP {r.status_code} {r.text[:100]}\n", "error")
     
+    def _run_single_sim_and_sc(self, var_name: str, payload: dict,
+                                cand: dict, failed_phase: str,
+                                max_tune_attempts: int,
+                                is_optimization: bool) -> bool:
+        """
+        Run a single simulation with custom settings, then run SC.
+        Used by SC neutralization degradation: same expr, different neutralization dim.
+        
+        Returns True if IS pass AND SC pass, False otherwise.
+        """
+        try:
+            r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
+        except Exception as e:
+            log(f"    ❌ POST: {e}")
+            return False
+        
+        if r.status_code == 401:
+            log("    ⚠️ 401 on sim POST, refreshing...", "warn")
+            self.s = fresh_session()
+            _last_auth_time = time.time()
+            try:
+                r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
+            except Exception as e:
+                log(f"    ❌ Sim retry POST failed: {e}")
+                return False
+        
+        if r.status_code == 429:
+            retry = int(r.headers.get("Retry-After", 60))
+            log(f"    ⚠️ 429: wait {min(retry, 60)}s")
+            time.sleep(min(retry, 60))
+            try:
+                r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
+            except:
+                return False
+        
+        if r.status_code != 201:
+            log(f"    ❌ HTTP {r.status_code}")
+            return False
+        
+        sim_id = r.headers.get("Location", "").split("/")[-1]
+        
+        def is_ready(data):
+            return data.get("alpha") if data.get("alpha") else None
+        
+        alpha_id, self.s = adaptive_poll(
+            self.s, f"{API}/simulations/{sim_id}",
+            f"Tune {var_name}",
+            is_ready, max_wait=3600,
+            initial_interval=15, fallback_interval=60,
+            stuck_threshold=300
+        )
+        
+        if not alpha_id:
+            log(f"    ❌ IS timeout")
+            return False
+        
+        # Fetch IS details
+        r2 = self.s.get(f"{API}/alphas/{alpha_id}", timeout=30)
+        if r2.status_code != 200:
+            return False
+        
+        ad = r2.json()
+        checks = ad.get("is", {}).get("checks", []) if isinstance(ad.get("is"), dict) else []
+        stats = ad.get("is", {}) if isinstance(ad.get("is"), dict) else {}
+        
+        sharpe_val = stats.get("sharpe")
+        fitness_val = stats.get("fitness")
+        passes = sum(1 for c in checks if c.get("result") == "PASS")
+        fails = sum(1 for c in checks if c.get("result") == "FAIL")
+        
+        is_pass = (sharpe_val is not None and fails <= 1 and passes >= 6)
+        soft_pass = (sharpe_val is not None and fails <= 2 and passes >= 4
+                     and not is_pass
+                     and (sharpe_val >= 1.25
+                          or (sharpe_val >= 1.0 and fitness_val is not None and fitness_val >= 0.8)))
+        
+        neutral = ad.get("settings", {}).get("neutralization", "?")
+        log(f"    IS: S={sharpe_val:.2f} F={fitness_val} | {passes}P/{fails}F | {neutral}")
+        
+        if not (is_pass or soft_pass):
+            log(f"    ❌ IS failed")
+            return False
+        
+        # Patch alpha name/tags
+        try:
+            self.s.patch(f"{API}/alphas/{alpha_id}",
+                json={"name": var_name, "color": "GREEN",
+                      "category": "FUNDAMENTAL", "tags": ["workflow-v2-tune", f"neut_{neutral}"]}, timeout=15)
+        except: pass
+        
+        # IS pass → run SC
+        var = {"alpha_id": alpha_id, "name": var_name, "expr": payload["regular"],
+               "sharpe": sharpe_val, "fitness": fitness_val,
+               "_sc_attempt": 1}
+        sc_pass = self._run_sc(var)
+        
+        if sc_pass:
+            log(f"    ✅ SC passed! ({var.get('sc_value')})")
+            # Copy back to cand
+            cand["alpha_id"] = alpha_id
+            cand["sharpe"] = sharpe_val
+            cand["fitness"] = fitness_val
+            cand["is_status"] = "PASS"
+            cand["sc_value"] = var.get("sc_value")
+            cand["sc_result"] = "PASS"
+            cand["expr"] = payload["regular"]
+            cand["name"] = var_name
+            self.state["candidates_passed_is"] = self.state.get("candidates_passed_is", 0) + 1
+            self.state["candidates_passed_sc"] = self.state.get("candidates_passed_sc", 0) + 1
+            self.save_checkpoint()
+            return True
+        
+        log(f"    ❌ SC failed for {var_name}: {var.get('sc_value', '?')}")
+        return False
+    
+    # ── v3.19 Skeleton Popularity Tracking ─────────────────
+    
+    def _track_skeleton_outcome(self, cand: dict, outcome: str,
+                                 sharpe: float = None, sc_value: float = None):
+        """Track skeleton type success rates for popularity-based selection.
+        
+        outcome: 'quick_skip', 'quick_fail', 'is_fail', 'is_pass',
+                 'sc_fail', 'sc_pass', 'tune_fail', 'tune_pass', 'submitted'
+        """
+        sk = cand.get("skeleton", "other")
+        state = self.state
+        pop = state.setdefault("skeleton_popularity", {})
+        sk_data = pop.setdefault(sk, {
+            "attempts": 0, "is_pass": 0, "sc_pass": 0,
+            "is_pass_rate": 0.0, "sc_pass_rate": 0.0,
+            "avg_sharpe": 0.0, "sharpe_sum": 0.0,
+            "weighted_score": 0.0,
+        })
+        sk_data["attempts"] += 1
+        if sharpe is not None and sharpe > 0:
+            sk_data["sharpe_sum"] = sk_data.get("sharpe_sum", 0) + sharpe
+            sk_data["avg_sharpe"] = sk_data["sharpe_sum"] / max(sk_data["attempts"], 1)
+        if outcome in ("is_pass", "tune_pass"):
+            sk_data["is_pass"] += 1
+        if outcome in ("sc_pass",):
+            sk_data["sc_pass"] += 1
+            sk_data["sc_pass_rate"] = sk_data["sc_pass"] / max(sk_data["attempts"], 1)
+        sk_data["is_pass_rate"] = sk_data["is_pass"] / max(sk_data["attempts"], 1)
+        # Weighted score: pass_rate * avg_sharpe * sc_bonus
+        sc_bonus = 1.0 + sk_data.get("sc_pass_rate", 0) * 2
+        sk_data["weighted_score"] = sk_data["is_pass_rate"] * sk_data["avg_sharpe"] * sc_bonus
+    
+    def _apply_skeleton_decay(self):
+        """Apply recency decay to skeleton popularity each batch."""
+        state = self.state
+        pop = state.get("skeleton_popularity", {})
+        decay = state.get("skeleton_popularity_decay", 1.0)
+        if not pop or decay >= 1.0:
+            return
+        for sk, data in pop.items():
+            data["attempts"] = max(1, int(data["attempts"] * decay))
+            data["is_pass"] = max(0, int(data["is_pass"] * decay))
+            data["sc_pass"] = max(0, int(data["sc_pass"] * decay))
+            data["sharpe_sum"] *= decay
+            if data["attempts"] > 0:
+                data["avg_sharpe"] = data["sharpe_sum"] / data["attempts"]
+                data["is_pass_rate"] = data["is_pass"] / data["attempts"]
+                data["sc_pass_rate"] = data["sc_pass"] / max(data["attempts"], 1)
+            sc_bonus = 1.0 + data.get("sc_pass_rate", 0) * 2
+            data["weighted_score"] = data["is_pass_rate"] * data["avg_sharpe"] * sc_bonus
+    
     # ── Optimization Strategy ─────────────────────────────────
     
     def _should_optimize(self, S: float, F: float) -> bool:
@@ -2735,11 +3237,14 @@ class Workflow:
     
     def _tune_and_retry(self, cand: dict, ortho: dict, failed_phase: str,
                          is_optimization: bool = False,
-                         opt_strategy: dict = None) -> bool:
+                         opt_strategy: dict = None,
+                         settings_override: dict = None) -> bool:
         """
         Generate tuned variations of a candidate and retry.
         failed_phase: "is" or "sc"
         is_optimization: True = post-pass tuning (test all, pick best S > original)
+        settings_override: dict — override default sim settings (e.g. neutralization dim).
+                            If None, uses DEFAULT_SETTINGS.
         """
         max_tune_attempts = 8 if is_optimization else 5
         variations = []
@@ -2843,7 +3348,32 @@ class Workflow:
                 if len(variations) < 3 or all(v.get("momentum_field","") != "corr_cv" for v in variations):
                     _generate_new_ratio_variations(cand, variations, ortho, max_tune_attempts)
 
-        else:
+        elif failed_phase == "sc":
+            # ── SC fail: try neutralization dimension degradation first (v3.19) ──
+            # WQ SELF_CORRELATION checks residual correlation in the same neutralization space.
+            # INDUSTRY is the coarsest layer; SECTOR/SUBINDUSTRY peel finer granularity,
+            # potentially eliminating pseudo-correlation and turning SC fail → pass.
+            # Strategy: reuse the SAME expression (preserve IS metrics), try finer dims.
+            base_expr = cand.get("expr", "")
+            base_name = cand.get("name", "orig")
+            if base_expr:
+                log(f"  🔍 SC neutralization degradation: testing SECTOR / SUBINDUSTRY on '{base_name}'")
+                for ndim in ["SECTOR", "SUBINDUSTRY"]:
+                    if not self.running:
+                        return False
+                    var_name = f"{base_name}_neut_{ndim}"[:40]
+                    log(f"    Attempt {ndim} neutralization...")
+                    # Override neutralization dimension for this sim
+                    override = dict(DEFAULT_SETTINGS) if settings_override else dict(DEFAULT_SETTINGS)
+                    override["neutralization"] = ndim
+                    payload = {"type": "REGULAR", "regular": base_expr, "settings": override}
+                    success = self._run_single_sim_and_sc(var_name, payload, cand, failed_phase, max_tune_attempts, is_optimization)
+                    if success:
+                        return True
+                    else:
+                        log(f"    {ndim} neutralization also failed, continuing to next dim")
+
+            # ── Neutralization degradation exhausted → try different field pairs (legacy) ──
             # SC failure: try entirely different field pairs
             # Use the orthogonality data to find the most orthogonal field combinations
             field_usage = ortho["fields_used"]
