@@ -74,8 +74,9 @@ graph TD
 
     %% 5. SC
     subgraph S5["5️⃣ SC 提交"]
-        S1SC[_run_sc<br>SELF_CORRELATION]:::action --> S2SC[adaptive_poll<br>30s → 120s<br>超时 4h (P7)]:::action
-        S2SC --> S3SC{SC &lt; 0.90?}:::decision
+        S1SC[_run_sc<br>SELF_CORRELATION]:::action --> S2SC[adaptive_poll<br>30s → 120s<br>超时 2h]:::action
+        S2SC --> S2SC2[📈 quadruple SC<br>回归数据自动记录<br>(v3.17)]:::action
+        S2SC2 --> S3SC{SC < 0.90?}:::decision
         S3SC -->|✅ ≥0.90| S4SC[✅ 提交 → ACTIVE 🎉<br>飞书通知 🎉]:::action
         S3SC -->|❌ &lt;0.90| S5SC[SC 调参重试<br>换字段组合<br>5变体上限]:::action
         S5SC --> S6SC{成功?}:::decision
@@ -281,7 +282,8 @@ pv1:          close, volume, adv20, returns, vwap, open, high, low
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-| v3.16 | 2026-06-02 | **field quadruple → SC 关联模型**：从 pair-family 二阶近似升级为 field-level 四元组追踪。`_extract_field_quadruples()` 提取 `rank(A/B)*rank(C/D)` 的四元组 `(A,B,C,D)`；正交分析追踪所有 ACTIVE 的四元组；候选评分时对共享 field pair 的 MULT 表达式施加 -5（精确重叠）/ -2（部分重叠）/ -8（完全复用）惩罚，更精确地预测 WQ SELF_CORRELATION |
+|| v3.17 | 2026-06-02 | **SC 回归模型 + S=None 裂缝修复**：① `quadruple_sc_stats` 表收集每个四元组的历史 SC pass/fail 比率，`get_quad_sc_penalty()` 在正交评分中施加数据驱动惩罚（<3 样本无惩罚 / pass_rate≥0.7 无惩罚 / 0.5-0.7 扣 1 / <0.5 扣 3）；② `record_quadruple_sc()` 在 SC 结果产出时自动记录四元组→SC 结果对；③ `_tune_and_retry` S=None 从 `break` 改为 `continue`，避免错误放弃同批次中可能存活的其他字段组合变体 |
+|| v3.16 | 2026-06-02 | **field quadruple → SC 关联模型**：从 pair-family 二阶近似升级为 field-level 四元组追踪。`_extract_field_quadruples()` 提取 `rank(A/B)*rank(C/D)` 的四元组 `(A,B,C,D)`；正交分析追踪所有 ACTIVE 的四元组；候选评分时对共享 field pair 的 MULT 表达式施加 -5（精确重叠）/ -2（部分重叠）/ -8（完全复用）惩罚，更精确地预测 WQ SELF_CORRELATION |
 | v3.15 | 2026-06-02 | SC 轮询卡死 + Session 泄露 + 提交前健康探测 |
 | v3.14 | 2026-06-02 | P7: 骨架旋转结构化计数 + 优先级逆转；P12: _strip_last_term paren-depth 扫描 |
 | v3.13 | 2026-06-02 | P0-P2 六项修复：正向激励→反向激励、ratio pattern 嵌套支持、SELF_CORRELATION 四元组频率追踪、pure_mult 字段重叠放宽、骨架旋转结构化分类 |

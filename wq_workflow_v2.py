@@ -198,6 +198,22 @@ def _extract_field_quadruples(expr: str) -> list:
             quadruples.append(quad)
     return quadruples
 
+
+def _normalize_quad_key(quad) -> str:
+    """
+    Convert a quadruple tuple to a normalized string key for DB lookup.
+    quad is: ((a, b), (c, d)) where each pair is sorted alphabetically.
+    Output: "a/b,c/d" normalized.
+    """
+    if not quad:
+        return ""
+    pair1_str = "/".join(quad[0])
+    pair2_str = "/".join(quad[1])
+    # Normalize: sort pair order so (A/B,C/D) == (C/D,A/B)
+    if pair1_str <= pair2_str:
+        return f"{pair1_str},{pair2_str}"
+    return f"{pair2_str},{pair1_str}"
+
 # ── Field time-frequency compatibility groups ──
 # Mixing daily-updated (pv1) with quarterly-updated (fundamental6) fields in ratio pairs
 # causes NA coverage misalignment → S=None in WQ engine
@@ -684,6 +700,16 @@ def score_candidate_orthogonality(expr: str, ortho: dict, active_exprs: list) ->
                 novelty_score += 3
             elif stype == "pure_mult" and "*" in expr and "+" not in expr and "/" in expr:
                 novelty_score += 1
+    
+    # ── Historical SC pass rate penalty (v3.17 regression model) ──
+    # Apply data-driven penalty: if a quadruple has poor SC history,
+    # reduce orthogonality score proportionally.
+    for cand_quad in candidate_quads:
+        quad_key = _normalize_quad_key(cand_quad)
+        if quad_key:
+            adjusted, penalty = _wqdb.get_quad_sc_penalty(quad_key, 0.0)
+            if penalty > 0:
+                novelty_score -= penalty  # Scale penalty to full score space
     
     return novelty_score
 
@@ -2443,6 +2469,19 @@ class Workflow:
             phase="sc_submit"
         )
         
+        # ── RECORD: quadruple SC regression data (v3.17) ──
+        # Extract quadruples from this expression and record SC outcome
+        # Only for MULT-style expressions that have quadruples
+        try:
+            quads = _extract_field_quadruples(cand.get("expr", ""))
+            for quad in quads:
+                qk = _normalize_quad_key(quad)
+                if qk:
+                    _wqdb.record_quadruple_sc(qk, is_pass)
+                    log(f"    📈 quad {qk} SC={'PASS' if is_pass else 'FAIL'} (regression record)")
+        except:
+            pass  # Non-MULT expression, no quadruples to record
+        
         if is_pass:
             notify(f"SC通过 ✅ {cand['name']}\nSC={cand['sc_value']}\n{cand['expr'][:60]}",
                    emoji="✅", dedup_key=f"sc_{cand.get('alpha_id','')}")
@@ -2982,8 +3021,7 @@ class Workflow:
             if not (is_pass or soft_pass):
                 log(f"    ❌ IS failed")
                 if var['sharpe'] is None:
-                    log(f"    S=None (dead pair), skipping remaining tunes")
-                    break
+                    log(f"    S=None (dead pair), continuing to next variation (not breaking)")
                 continue
 
             if soft_pass:
