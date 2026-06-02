@@ -150,6 +150,54 @@ def _extract_ratio_patterns(expr: str) -> list:
             patterns.append((num_family, den_family))
     return patterns
 
+
+# ── Field quadruple extraction for MULT expressions ──
+# For rank(A/B)*rank(C/D), extracts the quadruple (A,B,C,D).
+# This is the most granular SC predictor: WQ SELF_CORRELATION checks
+# if the two ratio signals are correlated at the field level.
+# Pair-family tracking is a second-order approximation; quadruple tracking
+# captures the exact field interaction.
+_QUAD_PATTERN = re.compile(
+    r'rank\(\s*([^)]+)\s*/\s*([^)]+)\s*\)\s*\*\s*rank\(\s*([^)]+)\s*/\s*([^)]+)\s*\)'
+)
+
+
+def _extract_field_quadruples(expr: str) -> list:
+    """Extract field quadruples from MULT expressions.
+
+    For rank(A/B)*rank(C/D), returns list of (a, b, c, d) where each is
+    the effective field (last field found in the numerator/denominator).
+
+    Handles nested ratios: rank(ts_delta(close,5)/enterprise_value)*rank(debt/equity)
+    → [('close', 'enterprise_value', 'debt', 'equity')]
+
+    Returns empty list for non-MULT expressions.
+    """
+    quadruples = []
+    for m in _QUAD_PATTERN.finditer(expr):
+        num1_raw = m.group(1).strip()
+        den1_raw = m.group(2).strip()
+        num2_raw = m.group(3).strip()
+        den2_raw = m.group(4).strip()
+
+        # Extract effective fields (last field found in each side)
+        num1_fields = FIELD_PATTERN.findall(num1_raw)
+        den1_fields = FIELD_PATTERN.findall(den1_raw)
+        num2_fields = FIELD_PATTERN.findall(num2_raw)
+        den2_fields = FIELD_PATTERN.findall(den2_raw)
+
+        if all([num1_fields, den1_fields, num2_fields, den2_fields]):
+            a = num1_fields[-1]
+            b = den1_fields[-1]
+            c = num2_fields[-1]
+            d = den2_fields[-1]
+            # Normalize: frozenset of (pair1, pair2) so (A/B, C/D) == (C/D, A/B)
+            pair1 = tuple(sorted([a, b]))
+            pair2 = tuple(sorted([c, d]))
+            quad = tuple(sorted([pair1, pair2]))
+            quadruples.append(quad)
+    return quadruples
+
 # ── Field time-frequency compatibility groups ──
 # Mixing daily-updated (pv1) with quarterly-updated (fundamental6) fields in ratio pairs
 # causes NA coverage misalignment → S=None in WQ engine
@@ -403,6 +451,7 @@ def analyze_orthogonality(alphas: list) -> dict:
     structures = []
     field_pairs_used = set()
     ratio_pattern_freq = {}  # {(num_family, den_family): count_of_actives}
+    active_quadruples = {}  # {quadruple_key: [expr_snippets]} — field-level pair tracking
 
     for a in alphas:
         expr = a["expr"]
@@ -460,6 +509,20 @@ def analyze_orthogonality(alphas: list) -> dict:
         for (num_fam, den_fam) in _extract_ratio_patterns(expr):
             key = (num_fam, den_fam)
             ratio_pattern_freq[key] = ratio_pattern_freq.get(key, 0) + 1
+        
+        # ── NEW: Extract field quadruples for MULT expressions ──
+        # For rank(A/B)*rank(C/D), extracts normalized quadruples.
+        # This is the most granular SC predictor: WQ SELF_CORRELATION checks
+        # if the two ratio signals share overlapping field pairs.
+        # Pair-family tracking is second-order; quadruple tracking is field-level.
+        # NOTE: We don't store SC result here (ACTIVE alphas may or may not have SC data).
+        # Instead, _extract_field_quadruples() is used in scoring to check overlap
+        # with existing ACTIVE expressions' quadruples.
+        for quad in _extract_field_quadruples(expr):
+            quad_key = quad  # tuple of ((a,b), (c,d)) normalized pairs
+            if quad_key not in active_quadruples:
+                active_quadruples[quad_key] = []
+            active_quadruples[quad_key].append(expr[:60])
     
     # Sort fields by usage (most used first)
     sorted_fields = sorted(fields_used.items(), key=lambda x: -x[1])
@@ -482,6 +545,7 @@ def analyze_orthogonality(alphas: list) -> dict:
         "structures": structures,
         "field_pairs_used": field_pairs_used,
         "ratio_pattern_freq": ratio_pattern_freq,
+        "active_quadruples": active_quadruples,
         "zero_usage_fields": zero_usage,
         "low_usage_fields": low_usage,
         "subtraction_count": sub_count,
@@ -548,6 +612,37 @@ def score_candidate_orthogonality(expr: str, ortho: dict, active_exprs: list) ->
         count_in_family = sum(1 for (nf, df), c in pattern_freq.items() if nf == num_fam and c > 0)
         if count_in_family > 1:
             novelty_score -= 2  # Cross-field numerator family collision
+    
+    # ── Field quadruple overlap penalty for MULT expressions ──
+    # The most granular SC predictor: for rank(A/B)*rank(C/D), WQ SELF_CORRELATION
+    # checks if the two ratio signals overlap in field pairs.
+    # If a candidate's quadruple shares a pair with any ACTIVE expression,
+    # the two signals are more likely correlated → lower SC score.
+    # This is field-level (not family-level), making it the most specific predictor.
+    candidate_quads = _extract_field_quadruples(expr)
+    active_quads = ortho.get("active_quadruples", {})
+    for cand_quad in candidate_quads:
+        # cand_quad is a tuple of two sorted pair tuples: ((a,b), (c,d))
+        pair1, pair2 = cand_quad
+        # Check if either of candidate's pairs overlaps with any ACTIVE expression's pair
+        for active_quad_key, active_expr_snippets in active_quads.items():
+            for active_pair in active_quad_key:
+                # If candidate shares ANY field pair with an existing ACTIVE's pair,
+                # reduce orthogonality score — signals will be correlated
+                if pair1 == active_pair or pair2 == active_pair:
+                    # -5 for exact pair overlap (same A/B or same C/D)
+                    # -2 for shared numerator field in different pair (partial overlap)
+                    novelty_score -= 5
+                    break  # One overlap per active quad is enough
+                # Partial overlap: if numerator fields overlap
+                c1_fields = set(pair1)
+                c2_fields = set(pair2)
+                a1_fields = set(active_pair)
+                if c1_fields & a1_fields or c2_fields & a1_fields:
+                    novelty_score -= 2  # Partial field overlap
+        # Check if this exact quadruple already exists in ACTIVE
+        if cand_quad in active_quads:
+            novelty_score -= 8  # Exact quadruple reuse → high correlation risk
     
     # ── AST structure collision penalty (revised: reverse incentive) ──
     # Instead of penalizing dominant skeletons, REWARD rare ones
