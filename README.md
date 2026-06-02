@@ -37,11 +37,13 @@ graph TD
     %% 2. Generate
     subgraph S2["2️⃣ 候选生成"]
         G1[MULT 模板已耗尽 ≥50%?]:::decision -->|否| G2[Phase 0: MULT<br>rank(A/B)*rank(C/D)+W*rank(M)]:::action
-        G1 -->|是| G3{stuck_batches % 3<br>+ 结构化骨架计数}:::decision
+        G1 -->|是| G3{failed_expressions<br>结构化骨架计数<br>(v3.19)}:::decision
         G3 -->|0| G2
         G3 -->|1| G4[Phase 1: DIRECT_RANK + PURE_ADD<br>零 ratio pair + 零时序]:::action
         G3 -->|2| G5[Phase 2: THREE_TERM + SUB<br>IND_NEUT + RATIO_LAG + PURE_MULT]:::action
         G2 & G4 & G5 --> G6[模板去重 + 取 Top-N]:::action
+        G6 --> G65[sd_score 拓扑距离加权排序<br>(v3.19 P2+P7)]:::action
+        G65 --> G7[Intra-batch 多样性保证<br>每批7种骨架类型各取≥1<br>(v3.19 P5)]:::action
     end
 
     G6 -->|for each candidate| S3
@@ -49,8 +51,8 @@ graph TD
     %% 3. Quick Test
     subgraph S3["3️⃣ Quick Test (P1Y)"]
         Q1[_quick_test<br>P1Y 轻量回测<br>P6: HTTP失败→False]:::action --> Q2{S=?}:::decision
-        Q2 -->|S=None<br>死对| SKIP[跳过]:::action
-        Q2 -->|S &lt; 1.0| FAIL[丢弃]:::action
+        Q2 -->|S=None<br>死对| SKIP[跳过<br>📊骨架失败追踪]:::action
+        Q2 -->|S &lt; 1.0| FAIL[丢弃<br>📊骨架失败追踪]:::action
         Q2 -->|S ≥ 1.0| PASS[通过 → Full IS]:::action
     end
 
@@ -62,11 +64,11 @@ graph TD
     subgraph S4["4️⃣ Full IS"]
         F1[_run_full_sim<br>全量 5Y 回测]:::action --> F2[adaptive_poll<br>15s → 60s → 120s<br>卡300s放弃]:::action
         F2 --> F3{IS status?}:::decision
-        F3 -->|PASS<br>fail≤1 pass≥6| F4[✅ 优化策略<br>S≥2.0直接提交<br>&lt;1.3进调参]:::action
+        F3 -->|PASS<br>fail≤1 pass≥6| F4[✅ 优化策略<br>S≥2.0直接提交<br>&lt;1.3进调参<br>📊骨架成功追踪]:::action
         F3 -->|PASS(软)<br>fail≤2 pass≥4<br>&amp;&amp; (S≥1.25<br>或 S≥1.0+F≥0.8)| F5
         F3 -->|TUNE - S强<br>S≥1.25 fail≤2<br>软通过路径| F5
-        F3 -->|FAIL| F9[✖ 候选丢弃<br>飞书通知 ⚠️]:::action
-        F4 & F5 --> F8[进入 SC<br>飞书通知 ✅]:::action
+        F3 -->|FAIL| F9[✖ 候选丢弃<br>📊骨架失败追踪<br>飞书通知 ⚠️]:::action
+        F4 & F5 --> F8[进入 SC<br>📊骨架成功追踪<br>飞书通知 ✅]:::action
     end
 
     F8 --> S5
@@ -76,12 +78,12 @@ graph TD
     subgraph S5["5️⃣ SC 提交"]
         S1SC[_run_sc<br>SELF_CORRELATION]:::action --> S2SC[adaptive_poll<br>30s → 120s<br>超时 2h]:::action
         S2SC --> S2SC2[📈 quadruple SC<br>回归数据自动记录<br>(v3.17)]:::action
-        S2SC2 --> S3SC{SC < 0.90?}:::decision
-        S3SC -->|✅ ≥0.90| S4SC[✅ 提交 → ACTIVE 🎉<br>飞书通知 🎉]:::action
-        S3SC -->|❌ &lt;0.90| S5SC[SC 调参重试<br>换字段组合<br>5变体上限]:::action
+        S2SC2 --> S3SC{SC &lt; 0.90?}:::decision
+        S3SC -->|✅ ≥0.90| S4SC[✅ 提交 → ACTIVE 🎉<br>📊骨架成功追踪<br>飞书通知 🎉]:::action
+        S3SC -->|❌ &lt;0.90| S5SC[SC 调参重试<br>换字段组合<br>📊骨架失败追踪<br>5变体上限]:::action
         S5SC --> S6SC{成功?}:::decision
         S6SC -->|✅ 是| S2SC
-        S6SC -->|❌ 否| S7SC[✖ SC 耗尽<br>飞书通知 ⚠️]:::action
+        S6SC -->|❌ 否| S7SC[✖ SC 耗尽<br>📊骨架失败追踪<br>飞书通知 ⚠️]:::action
     end
 
     S4SC --> STUCK
@@ -295,7 +297,7 @@ pv1:          close, volume, adv20, returns, vwap, open, high, low
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-|| v3.19 | 2026-06-02 | **SC 中性化降维重试**：SC fail 时优先尝试同表达式在不同中性化维度（SECTOR → SUBINDUSTRY）上重新运行 IS + SC。原理：WQ SELF_CORRELATION 计算同一中性化空间残差相关性，INDUSTRY 粒度偏粗，SECTOR/SUBINDUSTRY 可消除伪相关。降维全失败后仍走换字段对的 tune 逻辑（v3.18 P13 修复）。新增 `_run_single_sim_and_sc()` 方法支持自定义 settings。 |\n|| v3.18 | 2026-06-02 | **_tune_and_retry SC 失败分支 field pair 生成修复（3 项裂缝）**：① 移除 `sales`（零覆盖率 S=None 死字段）；② 新增时间频率兼容性检查（pv1 num × fund den → S=None），将 denoms/nums 拆分为 fund/ pv1 两个子池分别过滤；③ 与 `_generate_new_ratio_variations` 逻辑同步（二者均使用 `FUND_FIELDS` 分组 + time-frequency 过滤） |
+| v3.19 | 2026-06-02 | **🧬 骨架进化系统 v3.19 — 7 项改进（P1-P7）**：① **P1 成功/失败追踪**：每个骨架类型（MULT/DIRECT_RANK/THREE_TERM/IND_NEUT/PURE_MULT/SUB/SINGLE）追踪历史通过率，`_apply_skeleton_decay()` 批量启动前自动降权低通过率骨架；② **P2 StructuralDistanceMatrix 接入正交评分**：`score_candidate_orthogonality()` 增加 `sd_score` 权重字段，基于 AST 骨架拓扑距离的正交性评分；③ **P3 高级骨架生成器**：新增 4 个生成器 — `cross_gate`（跨阈值 gates）、`sign_switch`（符号翻转）、`vol_adj`（波动率调整）、`deep_cascade`（深度级联 3+ 项），在 `generate_candidates()` 中完整调用；④ **P4 细粒度骨架旋转**：7 种骨架类型精确计数替代旧的 `stuck_batches % 3` 三阶段轮换；⑤ **P5 Intra-batch 多样性保证**：选池去重后确保每批候选覆盖所有 7 种骨架类型（每种至少 1 个）；⑥ **P6 时序多样性衰减**：track 活跃表达式中字段+算子组合使用频率，对新候选施加衰减惩罚；⑦ **P7 结构拓扑距离正交评分**：SDMatrix 内置 1000 条随机骨架训练 + 增量更新，`_extract_skeleton_features()` 从 AST 提取 `(skeleton_type, field_groups, operators, num_den_pairs)` 四元组特征 |\n|| v3.18 | 2026-06-02 | **_tune_and_retry SC 失败分支 field pair 生成修复（3 项裂缝）**：① 移除 `sales`（零覆盖率 S=None 死字段）；② 新增时间频率兼容性检查（pv1 num × fund den → S=None），将 denoms/nums 拆分为 fund/ pv1 两个子池分别过滤；③ 与 `_generate_new_ratio_variations` 逻辑同步（二者均使用 `FUND_FIELDS` 分组 + time-frequency 过滤） |
 || v3.16 | 2026-06-02 | **field quadruple → SC 关联模型**：从 pair-family 二阶近似升级为 field-level 四元组追踪。`_extract_field_quadruples()` 提取 `rank(A/B)*rank(C/D)` 的四元组 `(A,B,C,D)`；正交分析追踪所有 ACTIVE 的四元组；候选评分时对共享 field pair 的 MULT 表达式施加 -5（精确重叠）/ -2（部分重叠）/ -8（完全复用）惩罚，更精确地预测 WQ SELF_CORRELATION |
 | v3.15 | 2026-06-02 | SC 轮询卡死 + Session 泄露 + 提交前健康探测 |
 | v3.14 | 2026-06-02 | P7: 骨架旋转结构化计数 + 优先级逆转；P12: _strip_last_term paren-depth 扫描 |

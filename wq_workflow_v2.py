@@ -1549,7 +1549,7 @@ def _generate_deep_cascade_candidates(ortho: dict, active_exprs: list) -> list:
             continue
         seen_exprs.add(c["expr"])
         deduped.append(c)
-    deduped.sort(key=lambda x: -x["orthogonology_score"])
+    deduped.sort(key=lambda x: -x["orthogonality_score"])
     return deduped
 
 
@@ -1688,7 +1688,23 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     if ratio_lag:
         log(f"  ⏰ Adding {len(ratio_lag)} RATIO_LAG candidates")
         all_candidates.extend(ratio_lag)
-    
+
+    # ── Advanced skeleton generators (v3.19) ──
+    # cross_gate, sign_switch, vol_adj, deep_cascade — each uses proven fields
+    # and at least one ts_* operator (S≠None guaranteed).
+    for gen_fn, skel_type, label in [
+        (_generate_cross_gate_candidates, SKELETON_CROSS_GATE, "CROSS_GATE"),
+        (_generate_sign_switch_candidates, SKELETON_SIGN_SWITCH, "SIGN_SWITCH"),
+        (_generate_vol_adj_candidates, SKELETON_VOL_ADJ, "VOL_ADJ"),
+        (_generate_deep_cascade_candidates, SKELETON_DEEP_CASCADE, "DEEP_CASCADE"),
+    ]:
+        advanced = gen_fn(ortho, active_exprs)
+        if advanced:
+            log(f"  🆕 Adding {len(advanced)} {label} candidates")
+            for c in advanced:
+                c["skeleton"] = skel_type
+            all_candidates.extend(advanced)
+
     if not all_candidates:
         log("  ⚠️ No candidates generated!", "error")
         return []
@@ -1706,14 +1722,99 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         seen_exprs.add(c["expr"])
         deduped.append(c)
     
-    # ── Skeleton rotation: cycle through skeletons to prevent MULT lock-in ──
-    # Instead of relying on stuck_batches (which is unreliable), use failed expr skeleton counts.
-    # Use the _get_skeleton_type function for accurate classification.
-    
+    # ── StructuralDistanceMatrix for scoring (P2 + P7: topological distance in scoring) ──
+    sdm = StructuralDistanceMatrix()
+    # Pre-compute features for all known expressions (failed + active)
+    known_for_dist = list(seen_exprs) | set(active_exprs)
+    for _e in list(known_for_dist):
+        if _e:
+            sdm.extract_features(_e)
+
+    # ── Skeleton success/failure tracking (P1) ──
+    # Track skeleton-level win rates from failed_exprs
+    skeleton_stats = {}
+    if failed_exprs:
+        for _fe in failed_exprs:
+            _sk = _classify_v3_skeleton(_fe)
+            skeleton_stats[_sk] = skeleton_stats.get(_sk, 0) + 1
+
+    # ── Field usage decay score (P6: temporal diversity decay) ──
+    # Penalize field combos that are heavily used recently
+    field_decay = ortho.get("fields_used", {})
+    # Also use operator frequency as a proxy for diversity
+    op_freq = {}
+    for _e in known_for_dist:
+        for _op in ['rank', 'ts_mean', 'ts_delta', 'ts_corr', 'ts_rank', 'ts_std', 'sign', 'log', 'ind_neutral']:
+            _cnt = len(re.findall(r'\b' + _op + r'\(', _e))
+            if _cnt:
+                op_freq[_op] = op_freq.get(_op, 0) + _cnt
+    total_ops = max(sum(op_freq.values()), 1)
+    for _op in op_freq:
+        op_freq[_op] /= total_ops
+
+    def _decay_score(c):
+        """P6: Score penalty for over-used fields/operators. Lower = more decayed."""
+        expr = c["expr"]
+        penalty = 0.0
+        # Field decay: fields used in >3 active alphas get penalized
+        for _f in FIELD_PATTERN.findall(expr):
+            usage = field_decay.get(_f, 0)
+            if usage > 3:
+                penalty += 0.15 * (usage - 3)
+            elif usage > 1:
+                penalty += 0.05
+        # Operator decay: ts_* ops in high frequency in active set
+        for _op, _freq in op_freq.items():
+            if _op + '(' in expr and _freq > 0.15:
+                penalty += 0.1 * _freq
+        return penalty
+
+    def _topo_distance_score(c):
+        """P7: Bonus for structural diversity. Higher = more topologically different."""
+        expr = c["expr"]
+        min_sim = 0.0
+        for _e in list(known_for_dist):
+            if _e and len(_e) > 10:
+                sim = sdm.structural_similarity(expr, _e)
+                if sim > min_sim:
+                    min_sim = sim
+        # Higher min distance = more novel structure → bonus
+        # min_sim ranges from 0 (completely different) to ~0.9 (very similar)
+        # We want to reward expressions with min_sim < 0.4
+        if min_sim < 0.3:
+            return 5.0  # High novelty bonus
+        elif min_sim < 0.45:
+            return 2.5
+        elif min_sim < 0.6:
+            return 1.0
+        else:
+            return 0.0  # Too similar to existing expressions
+
+    # ── Enhanced composite score ──
+    for c in deduped:
+        base_score = c.get("orthogonality_score", 0)
+        # Apply P1: skeleton failure rate penalty
+        sk = c.get("skeleton", "unknown")
+        fail_count = skeleton_stats.get(sk, 0)
+        if fail_count > 5:
+            base_score -= 1.5  # Heavy penalty on failed skeletons
+        elif fail_count > 2:
+            base_score -= 0.5
+        # Apply P6: temporal decay penalty
+        decay = _decay_score(c)
+        base_score -= decay
+        # Apply P7: topological distance bonus
+        topo = _topo_distance_score(c)
+        base_score += topo
+        # Update the composite score
+        c["composite_score"] = round(base_score, 2)
+        c["decay_penalty"] = decay
+        c["topo_bonus"] = topo
+
     def _sort_key(c):
-        return -c["orthogonality_score"]
-    
-    # Classify failed expressions into skeleton groups using reliable heuristics
+        return -c.get("composite_score", c.get("orthogonality_score", 0))
+
+    deduped.sort(key=_sort_key)
     failed_skeleton_counts = {
         SKELETON_MULT: 0,
         SKELETON_DIRECT_RANK: 0,
@@ -1794,8 +1895,6 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         return g
     
     # ── MULT exhaustion detection ──
-    # Check if failed_expressions already contains all 4 weight variants
-    # for ≥ 50% of MULT templates → skip MULT entirely
     mult_pool = sorted_group(SKELETON_MULT)
     mult_exhausted = False
     if failed_exprs and mult_pool:
@@ -1805,13 +1904,14 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         total_templates = 0
         for c in mult_pool:
             tkey = re.sub(r'\+[0-9.]+', '+W*', c["expr"])
+
             if tkey in seen_templates:
                 continue
             seen_templates.add(tkey)
             total_templates += 1
-            # All 4 weights tested and in failed list?
             all_tested = all(
                 re.sub(r'\+[0-9.]+', f'+{w}', c["expr"]) in failed_exprs
+
                 for w in MULT_WEIGHTS
             )
             if all_tested:
@@ -1820,52 +1920,133 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
             mult_exhausted = True
             log(f"  🔄 MULT exhausted: {exhausted_count}/{total_templates} templates fully tested, skipping")
     
+    # ── v3.19 Enhanced Skeleton Rotation (P4: 7-group rotation) ──
+    # Extended from 3-phase to 7-skeleton groups with adaptive phase shifting
+    
+    # Build failed pool skeleton counts using v3 classifier for accuracy
+    failed_skeleton_counts = {}
+    if failed_exprs:
+        for fe in failed_exprs:
+            sk = _classify_v3_skeleton(fe)
+            failed_skeleton_counts[sk] = failed_skeleton_counts.get(sk, 0) + 1
+    
+    total_failed = sum(failed_skeleton_counts.values())
+    
+    # Adaptive rotation: shift phase if any skeleton dominates the failed pool
+    rotation_phase = stuck_batches % 7  # 0-6 for 7 skeleton groups
+    rotation_override = False
+    
+    # Check for dominance and force rotation
+    for sk, cnt in failed_skeleton_counts.items():
+        if cnt > total_failed * 2 // 3 and total_failed >= 3:
+            # This skeleton is overused → skip to the next unexplored group
+            phase_map = {
+                SKELETON_MULT: 0,
+                SKELETON_DIRECT_RANK: 1,
+                SKELETON_THREE_TERM: 2,
+                SKELETON_IND_NEUT: 3,
+                SKELETON_PURE_MULT: 4,
+                SKELETON_SUB: 5,
+                SKELETON_CROSS_GATE: 6,
+                SKELETON_SIGN_SWITCH: 0,
+                SKELETON_VOL_ADJ: 1,
+                SKELETON_DEEP_CASCADE: 2,
+                SKELETON_TSRANK_CORR: 3,
+                SKELETON_TREND_BREAK: 4,
+                SKELETON_NONLINEAR_BREAKER: 5,
+                "other": 6,
+            }
+            current_sk_phase = phase_map.get(sk, 6)
+            rotation_phase = (current_sk_phase + 1) % 7
+            rotation_override = True
+            log(f"  🔄 Skeleton dominance: {sk}={cnt}/{total_failed} → rotate to phase {rotation_phase}")
+            break
+    
+    log(f"  📊 Failed pool skeleton distribution: {dict((k, v) for k, v in failed_skeleton_counts.items() if v > 0)}")
+    log(f"  🔄 Rotation phase: {rotation_phase} (stuck_batches={stuck_batches}, override={rotation_override})")
+    
+    # ── v3.19 Selection with Intra-Batch Diversity (P5) ──
+    # Instead of taking n consecutive candidates from one skeleton group,
+    # use a round-robin approach across skeleton types to ensure diversity.
+    
+    # Phase mapping: each phase has a primary skeleton + secondary skeletons
+    phase_map = {
+        0: (SKELETON_MULT, [SKELETON_DIRECT_RANK, SKELETON_THREE_TERM]),
+        1: (SKELETON_DIRECT_RANK, [SKELETON_THREE_TERM, SKELETON_SUB]),
+        2: (SKELETON_THREE_TERM, [SKELETON_IND_NEUT, SKELETON_PURE_MULT]),
+        3: (SKELETON_IND_NEUT, [SKELETON_PURE_MULT, SKELETON_CROSS_GATE]),
+        4: (SKELETON_PURE_MULT, [SKELETON_SUB, SKELETON_SIGN_SWITCH]),
+        5: (SKELETON_SUB, [SKELETON_CROSS_GATE, SKELETON_VOL_ADJ]),
+        6: (SKELETON_CROSS_GATE, [SKELETON_SIGN_SWITCH, SKELETON_DEEP_CASCADE]),
+    }
+    
+    primary_sk, secondary_sks = phase_map.get(rotation_phase, phase_map[0])
+    
     result = []
+    seen_skeletons_in_batch = set()
     
-    # ── Phase 0: MULT (only if not exhausted) ──
-    if rotation_phase == 0 and mult_pool and not mult_exhausted:
-        # Pick one per template (weight-agnostic dedup)
-        seen_templates = set()
-        for c in mult_pool:
-            if len(result) >= n:
-                break
-            tkey = re.sub(r'\+[0-9.]+\*\w+\(.*\)$', '', c["expr"])
-            if tkey in seen_templates:
-                continue
-            seen_templates.add(tkey)
-            result.append(c)
-        log(f"  🟢 Phase 0: trying {len(result)} MULT candidates (template-deduped)")
+    # Round-robin selection: pick one from primary, then secondary, cycling for diversity
+    def pick_next(skeleton_type, min_count=1):
+        """Pick one candidate from a skeleton group, skipping ones already in batch."""
+        group = sorted_group(skeleton_type)
+        for c in group:
+            if c not in result:
+                result.append(c)
+                seen_skeletons_in_batch.add(skeleton_type)
     
-    # ── Phase 1: no-ratio skeletons (DIRECT_RANK with ts_*) ──
-    if rotation_phase == 1 or (rotation_phase == 0 and mult_exhausted):
-        tier1 = sorted_group(SKELETON_DIRECT_RANK)
-        tier1.sort(key=_sort_key)
-        result.extend(tier1[:n])
-        if len(result) < n:
-            tier2 = sorted_group(SKELETON_THREE_TERM) + sorted_group(SKELETON_PURE_MULT)
-            tier2.sort(key=_sort_key)
-            result.extend(tier2[:n - len(result)])
-        log(f"  🔵 Phase 1: trying {len(result)} DIRECT_RANK candidates (all with ts component)")
+    # Phase 0/4/6: primary exploration
+    if (rotation_phase in (0, 4, 6)) and sorted_group(primary_sk):
+        # MULT exhaustion check for phase 0
+        if rotation_phase == 0 and mult_exhausted:
+            pass  # skip primary, go to secondary
+        else:
+            # Pick up to n//2 from primary
+            group = sorted_group(primary_sk)
+            for c in group[:n//2]:
+                if c not in result and len(result) < n:
+                    result.append(c)
+                    seen_skeletons_in_batch.add(primary_sk)
     
-    # ── Phase 2: mixed exploration skeletons ──
-    if rotation_phase == 2 or (rotation_phase == 0 and mult_exhausted and not result):
-        tier1 = (sorted_group(SKELETON_IND_NEUT) + sorted_group(SKELETON_THREE_TERM) +
-                 sorted_group(SKELETON_PURE_MULT) + sorted_group(SKELETON_SUB))
-        tier1.sort(key=_sort_key)
-        # Within tier1, prefer skeletons with fewest occurrences in active
-        result.extend(tier1[:n])
-        if len(result) < n:
-            tier2 = sorted_group(SKELETON_DIRECT_RANK) + sorted_group(SKELETON_PURE_ADD)
-            tier2.sort(key=_sort_key)
-            result.extend(tier2[:n - len(result)])
-        log(f"  🟣 Phase 2: trying {len(result)} exploration candidates")
+    # Phase 1/5: DIRECT_RANK or SUB primary
+    if rotation_phase in (1, 5):
+        group = sorted_group(primary_sk)
+        for c in group[:n//2]:
+            if c not in result and len(result) < n:
+                result.append(c)
+                seen_skeletons_in_batch.add(primary_sk)
+    
+    # Phase 2/3: THREE_TERM or IND_NEUT primary
+    if rotation_phase in (2, 3):
+        group = sorted_group(primary_sk)
+        for c in group[:n//2]:
+            if c not in result and len(result) < n:
+                result.append(c)
+                seen_skeletons_in_batch.add(primary_sk)
+    
+    # Fill remaining slots from secondary skeleton groups
+    for sk in secondary_sks:
+        group = sorted_group(sk)
+        for c in group:
+            if c not in result and len(result) < n:
+                result.append(c)
+                seen_skeletons_in_batch.add(sk)
+    
+    # Final fallback: top candidates from any remaining groups
+    if len(result) < n:
+        for c in deduped:
+            if c not in result and len(result) < n:
+                result.append(c)
     
     result = result[:n]
     
+    log(f"  🎯 v3.19 selection: {len(result)} candidates, skeleton diversity: {len(seen_skeletons_in_batch)} types")
+    for sk_type in seen_skeletons_in_batch:
+        cnt = sum(1 for c in result if c.get("skeleton") == sk_type)
+        log(f"     {sk_type}: {cnt}")
     for c in result:
         log(f"  🎯 [{c.get('skeleton','?')[:4].upper()}] {c['name']}")
         log(f"        expr: {c['expr']}")
-        log(f"        ortho_score: {c['orthogonality_score']:.1f}")
+        log(f"        ortho_score: {c.get('orthogonality_score', 0):.1f} | composite: {c.get('composite_score', 0):.1f} | decay: {c.get('decay_penalty', 0):.2f} | topo: {c.get('topo_bonus', 0):.1f}")
     
     return result
 
@@ -2251,6 +2432,9 @@ class Workflow:
             self.state["phase"] = "orthogonality"
             self.save_checkpoint()
             
+            # 2.5. Apply skeleton popularity decay (P1)
+            self._apply_skeleton_decay()
+            
             # 3. Generate candidates
             candidates = generate_candidates(
                 ortho, [a["expr"] for a in actives], n=3,
@@ -2289,6 +2473,7 @@ class Workflow:
                 quick_pass = self._quick_test(cand)
                 if quick_pass == "skip":
                     log(f"⏩ {cand['name']}: S=None detected, skip (dead pair)")
+                    self._track_skeleton_outcome(cand, "quick_skip")
                     # ── RECORD: dead pair failure ──
                     _wqdb.record_alpha_event(
                         name=cand["name"], expr=cand["expr"],
@@ -2310,6 +2495,7 @@ class Workflow:
                     continue
                 if not quick_pass:
                     log(f"⏩ {cand['name']}: quick test failed, skip (S<1.0)")
+                    self._track_skeleton_outcome(cand, "quick_fail")
                     self.state["batch_progress"] = idx + 1
                     self.save_checkpoint()
                     continue
@@ -2328,11 +2514,12 @@ class Workflow:
                             event_type="failed",
                             alpha_id=cand.get("alpha_id"),
                             sharpe=cand.get("sharpe"),
-                            fitness=cand.get("fitness"),
                             is_status="IS_FAIL",
                             phase="full_sim",
                             notes="All IS variations failed"
                         )
+                        # ── RECORD: IS failure skeleton ──
+                        self._track_skeleton_outcome(cand, "is_fail", cand.get("sharpe"))
                         # Register the base expression to prevent regeneration
                         failed_list = self.state.setdefault("failed_expressions", [])
                         base_expr = cand.get("expr", "")
@@ -2365,6 +2552,9 @@ class Workflow:
                                emoji="⚠️", dedup_key=f"tune_fail_{cand.get('alpha_id','')}")
                         continue
                 
+                # ── Skeleton tracking: IS PASS ──
+                self._track_skeleton_outcome(cand, "is_pass", cand.get("sharpe"))
+                
                 # ── 4c. SC SUBMIT FIRST (priority over IS optimization) ──
                 # Rationale: IS PASS alpha MUST be tested by SC before any optimization.
                 # Tuning first risks losing the original IS PASS alpha if all variations fail.
@@ -2388,6 +2578,8 @@ class Workflow:
                             phase="sc_submit",
                             notes="All SC variations failed"
                         )
+                        # ── RECORD: SC failure skeleton ──
+                        self._track_skeleton_outcome(cand, "sc_fail", cand.get("sharpe"), cand.get("sc_value"))
                         self.state["batch_progress"] = idx + 1
                         self.save_checkpoint()
                         notify(f"SC耗尽 ✖️ {cand['name']}\nSC={cand.get('sc_value','?')}，换字段调参后仍失败",
@@ -2422,6 +2614,7 @@ class Workflow:
                         log(f"ℹ️ No improvement from optimization, keeping SC-passed original")
                 
                 # ── 4e. SUBMIT ──
+                self._track_skeleton_outcome(cand, "sc_pass", cand.get("sharpe"), cand.get("sc_value"))
                 self.state["phase"] = "submit"
                 self.save_checkpoint()
                 self._submit_alpha(cand, cand.get("alpha_id"))
