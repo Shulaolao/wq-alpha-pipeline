@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Graph } from '@antv/g6';
+
 
 interface WorkflowGraphProps {
   phase: string;
@@ -230,7 +230,7 @@ function getScaledLayout(width: number) {
 export default function WorkflowGraph({ phase, activeCount, target, batchIndex, batchTotal }: WorkflowGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const graphWrapperRef = useRef<HTMLDivElement>(null);
-  const graphRef = useRef<Graph | null>(null);
+  const graphRef = useRef<SVGSVGElement | null>(null);
   const [containerWidth, setContainerWidth] = useState(0);
   const [expanded, setExpanded] = useState(false);
   const [isMobile, setIsMobile] = useState(true);
@@ -256,145 +256,32 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
     return () => observer.disconnect();
   }, []);
 
-  // Render G6 graph when expanded
+  // Layout computation — runs every phase/width change
+  const layoutResult = expanded && containerWidth > 0
+    ? getScaledLayout(containerWidth)
+    : { nodePositions: {} as Record<string, { x: number; y: number }>, totalHeight: 300 };
+  const { nodePositions, totalHeight } = layoutResult;
+
+  const tier = containerWidth > 0
+    ? (containerWidth < 640 ? 'mobile' : containerWidth < 1024 ? 'tablet' : 'desktop')
+    : 'desktop';
+
+  const isMobileView = tier === 'mobile';
+
+  // Layout constants for styling
+  const layoutStyle = {
+    mobile: { nodeFont: 8, labelH: 11, minNodeW: 30, minNodeH: 22, decisionMinW: 26, decisionMinH: 26, rowVGap: 26, marginX: 8, marginY: 6, arrowSz: 3 },
+    tablet: { nodeFont: 10, labelH: 13, minNodeW: 38, minNodeH: 30, decisionMinW: 32, decisionMinH: 32, rowVGap: 32, marginX: 16, marginY: 8, arrowSz: 4 },
+    desktop: { nodeFont: 12, labelH: 15, minNodeW: 48, minNodeH: 36, decisionMinW: 40, decisionMinH: 40, rowVGap: 38, marginX: 24, marginY: 10, arrowSz: 5 },
+  }[tier]!;
+
+  const svgHeight = isMobileView ? Math.max(totalHeight + 80, 520) : Math.max(totalHeight, 300);
+
+  // Cleanup
   useEffect(() => {
-    if (!expanded) {
-      if (graphRef.current) {
-        graphRef.current.destroy();
-        graphRef.current = null;
-        graphMounted.current = false;
-      }
-      return;
-    }
-
-    const wrapper = graphWrapperRef.current;
-    if (!wrapper || containerWidth === 0) return;
-    // Small delay to let the wrapper mount
-    if (!graphMounted.current && graphRef.current) {
-      graphRef.current.destroy();
-      graphRef.current = null;
-    }
-
-    if (graphRef.current) return; // Already rendered
-    graphMounted.current = true;
-
-    const { nodePositions, isMobile, tier, totalHeight } = getScaledLayout(containerWidth);
-    const width = containerWidth;
-    const cLayout = {
-      mobile: { rowH: 64, marginX: 24, marginY: 10, nodeW: 32, nodeH: 24, decisionW: 28, decisionH: 28, labelFs: 9, labelOffY: -8, labelLineH: 12, labelMaxW: 80, edgeLabelFs: 5, edgeLabel: false, arrowSz: 3 },
-      tablet: { rowH: 82, marginX: 48, marginY: 14, nodeW: 42, nodeH: 32, decisionW: 36, decisionH: 36, labelFs: 10, labelOffY: -10, labelLineH: 13, labelMaxW: 120, edgeLabelFs: 6, edgeLabel: true, arrowSz: 4 },
-      desktop: { rowH: 104, marginX: 80, marginY: 16, nodeW: 54, nodeH: 40, decisionW: 40, decisionH: 40, labelFs: 12, labelOffY: -14, labelLineH: 15, labelMaxW: 160, edgeLabelFs: 7, edgeLabel: true, arrowSz: 5 },
-    }[tier]!;
-    const height = Math.max(totalHeight, 300);
-
-    const activeIds = new Set(ACTIVE_IDS_FOR_PHASE[phase] || ['org_ortho']);
-
-    const g6Nodes = NODES.map(n => {
-      const isActive = activeIds.has(n.id);
-      const colors = isActive ? ACTIVE_COLORS : NODE_COLORS[n.type];
-      const pos = nodePositions[n.id] || { x: width / 2, y: 0 };
-
-      const nodeSize = [
-        n.type === 'decision' ? cLayout.decisionW : cLayout.nodeW,
-        n.type === 'decision' ? cLayout.decisionH : cLayout.nodeH,
-      ];
-
-      const labelFontSize = isActive ? cLayout.labelFs : cLayout.labelFs - 1;
-
-      const style: Record<string, any> = {
-        size: nodeSize,
-        fill: colors.fill,
-        stroke: colors.stroke,
-        lineWidth: isActive ? 2 : 1.2,
-        labelFill: colors.label,
-        labelFontSize,
-        labelFontFamily: 'JetBrains Mono, monospace',
-        labelFontWeight: isActive ? 700 : 400,
-        labelText: `${n.label}${n.subtitle ? `\n${n.subtitle}` : ''}`,
-        labelPlacement: 'top',
-        labelLineHeight: cLayout.labelLineH,
-        labelMaxWidth: cLayout.labelMaxW,
-        labelOffsetX: 0,
-        labelOffsetY: cLayout.labelOffY,
-      };
-
-      return { id: n.id, data: { ...n, isActive }, style: { ...style, x: pos.x, y: pos.y } };
-    });
-
-    const g6Edges = EDGES.map(e => {
-      const isActivePath = activeIds.has(e.source) || activeIds.has(e.target);
-      return {
-        id: `${e.source}→${e.target}`,
-        source: e.source,
-        target: e.target,
-        style: {
-          stroke: isActivePath ? 'rgba(129, 140, 248, 0.5)' : 'rgba(255,255,255,0.06)',
-          lineWidth: isActivePath ? 1.2 : 0.5,
-          endArrow: true,
-          endArrowSize: cLayout.arrowSz,
-          labelText: cLayout.edgeLabel ? (e.label || '') : '',
-          labelFill: '#71717a',
-          labelFontSize: cLayout.edgeLabelFs,
-          labelFontFamily: 'JetBrains Mono, monospace',
-          labelBackground: true,
-          labelBackgroundFill: '#18181b',
-          labelBackgroundOpacity: 0.8,
-          labelBackgroundPadding: [1, 2],
-        },
-      };
-    });
-
-    const graph = new Graph({
-      container: wrapper,
-      width,
-      height,
-      animation: false,
-      autoFit: 'view',
-      zoomRange: [0.3, 2.5],
-      behaviors: ['drag-canvas', 'zoom-canvas'],
-    });
-
-    graph.setData({ nodes: g6Nodes, edges: g6Edges });
-    graph.render();
-    graphRef.current = graph;
-
-    let prevTier: string | null = null;
-    try { prevTier = getScaledLayout(containerRef.current!.clientWidth).tier; } catch {}
-
-    const handleResize = () => {
-      if (!containerRef.current || !graphRef.current) return;
-      const w = containerRef.current.clientWidth;
-      const layout = getScaledLayout(w);
-      // Cross-tier resize: destroy and rebuild to apply new layout constants
-      if (prevTier !== null && layout.tier !== prevTier) {
-        graphRef.current.destroy();
-        graphRef.current = null;
-        return;
-      }
-      // Same tier: safe to resize
-      const { totalHeight: th } = layout;
-      graphRef.current.setSize(w, Math.max(th, 300));
-      graphRef.current.fitView();
-      prevTier = layout.tier;
-    };
-
-    const observer = new ResizeObserver(handleResize);
-    if (containerRef.current) observer.observe(containerRef.current);
-
-    return () => {
-      observer.disconnect();
-    };
-  }, [expanded, phase, containerWidth]);
-
-  // Cleanup graph on unmount
-  useEffect(() => {
-    return () => {
-      if (graphRef.current) {
-        graphRef.current.destroy();
-        graphRef.current = null;
-      }
-    };
+    return () => {};
   }, []);
+
 
   const activeIds = new Set(ACTIVE_IDS_FOR_PHASE[phase] || ['org_ortho']);
   const activeNodeLabels = NODES.filter(n => activeIds.has(n.id)).map(n => n.label).join(' → ');
@@ -479,12 +366,104 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
             <span className="ml-auto">Pinch zoom</span>
           </div>
 
-          {/* Graph */}
-          <div
-            ref={graphWrapperRef}
-            className="w-full rounded-lg overflow-hidden bg-black/20"
-            style={{ minHeight: 300 }}
-          />
+          {/* SVG Pipeline Graph */}
+          <svg
+            viewBox={`0 0 ${containerWidth} ${svgHeight}`}
+            className="w-full rounded-lg bg-black/20"
+            style={{ height: svgHeight, minHeight: 300 }}
+            role="img"
+            aria-label="Workflow Pipeline"
+          >
+            <defs>
+              <marker id="arrow" markerWidth="6" markerHeight="4" refX="5" refY="2" orient="auto">
+                <path d="M0,0 L6,2 L0,4 Z" fill={tier === 'mobile' ? '#444' : '#555'} />
+              </marker>
+              <marker id="arrowActive" markerWidth="6" markerHeight="4" refX="5" refY="2" orient="auto">
+                <path d="M0,0 L6,2 L0,4 Z" fill="rgba(129,140,248,0.6)" />
+              </marker>
+            </defs>
+            {/* Edges */}
+            {EDGES.map((e, i) => {
+              const src = nodePositions[e.source];
+              const tgt = nodePositions[e.target];
+              if (!src || !tgt) return null;
+              const isActive = activeIds.has(e.source) || activeIds.has(e.target);
+              return (
+                <line
+                  key={i}
+                  x1={src.x} y1={src.y}
+                  x2={tgt.x} y2={tgt.y}
+                  stroke={isActive ? 'rgba(129,140,248,0.4)' : 'rgba(255,255,255,0.05)'}
+                  strokeWidth={isActive ? 1 : 0.5}
+                  markerEnd={isActive ? 'url(#arrowActive)' : 'url(#arrow)'}
+                />
+              );
+            })}
+            {/* Nodes */}
+            {NODES.map(n => {
+              const pos = nodePositions[n.id];
+              if (!pos) return null;
+              const isActive = activeIds.has(n.id);
+              const colors = isActive ? ACTIVE_COLORS : NODE_COLORS[n.type];
+              const isDec = n.type === 'decision';
+              const hasSub = !!n.subtitle;
+              // Node size based on content — ensures text fits inside
+              const baseW = layoutStyle.minNodeW;
+              const baseH = layoutStyle.minNodeH;
+              const w = hasSub ? Math.max(baseW, 50) : baseW;
+              const h = hasSub ? baseH * 1.6 : baseH;
+              return (
+                <g key={n.id}>
+                  {isDec ? (
+                    <rect
+                      x={pos.x - w/2} y={pos.y - h/2}
+                      width={w} height={h}
+                      fill={colors.fill} stroke={colors.stroke}
+                      strokeWidth={isActive ? 2 : 1.2}
+                      rx={4}
+                      transform={`rotate(45, ${pos.x}, ${pos.y})`}
+                    />
+                  ) : (
+                    <rect
+                      x={pos.x - w/2} y={pos.y - h/2}
+                      width={w} height={h}
+                      fill={colors.fill} stroke={colors.stroke}
+                      strokeWidth={isActive ? 2 : 1.2}
+                      rx={6}
+                    />
+                  )}
+                  {/* Subtitle — above label when exists */}
+                  {hasSub && (
+                    <text
+                      x={pos.x} y={pos.y - 3}
+                      textAnchor="middle"
+                      dominantBaseline="central"
+                      fill={colors.label}
+                      opacity={0.55}
+                      fontSize={layoutStyle.nodeFont - 2}
+                      fontFamily="'JetBrains Mono', 'SF Mono', monospace"
+                      style={{ pointerEvents: 'none', userSelect: 'none' }}
+                    >
+                      {n.subtitle}
+                    </text>
+                  )}
+                  {/* Main label — centered */}
+                  <text
+                    x={pos.x} y={hasSub ? pos.y + 5 : pos.y}
+                    textAnchor="middle"
+                    dominantBaseline="central"
+                    fill={colors.label}
+                    fontSize={isActive ? layoutStyle.nodeFont : layoutStyle.nodeFont - 1}
+                    fontFamily="'JetBrains Mono', 'SF Mono', monospace"
+                    fontWeight={isActive ? 700 : 400}
+                    style={{ pointerEvents: 'none', userSelect: 'none' }}
+                  >
+                    {n.label}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
         </>
       )}
     </div>
