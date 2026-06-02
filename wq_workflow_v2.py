@@ -1980,17 +1980,10 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
                 SKELETON_IND_NEUT: 3,
                 SKELETON_PURE_MULT: 4,
                 SKELETON_SUB: 5,
-                SKELETON_CROSS_GATE: 6,
-                SKELETON_SIGN_SWITCH: 0,
-                SKELETON_VOL_ADJ: 1,
-                SKELETON_DEEP_CASCADE: 2,
-                SKELETON_TSRANK_CORR: 3,
-                SKELETON_TREND_BREAK: 4,
-                SKELETON_NONLINEAR_BREAKER: 5,
                 "other": 6,
             }
             current_sk_phase = phase_map.get(sk, 6)
-            rotation_phase = (current_sk_phase + 1) % 7
+            rotation_phase = (current_sk_phase + 1) % 6
             rotation_override = True
             log(f"  🔄 Skeleton dominance: {sk}={cnt}/{total_failed} → rotate to phase {rotation_phase}")
             break
@@ -2003,14 +1996,14 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     # use a round-robin approach across skeleton types to ensure diversity.
     
     # Phase mapping: each phase has a primary skeleton + secondary skeletons
+    # Only includes active generators (CROSS_GATE, SIGN_SWITCH, VOL_ADJ, DEEP_CASCADE are disabled)
     phase_map = {
         0: (SKELETON_MULT, [SKELETON_DIRECT_RANK, SKELETON_THREE_TERM]),
         1: (SKELETON_DIRECT_RANK, [SKELETON_THREE_TERM, SKELETON_SUB]),
         2: (SKELETON_THREE_TERM, [SKELETON_IND_NEUT, SKELETON_PURE_MULT]),
-        3: (SKELETON_IND_NEUT, [SKELETON_PURE_MULT, SKELETON_CROSS_GATE]),
-        4: (SKELETON_PURE_MULT, [SKELETON_SUB, SKELETON_SIGN_SWITCH]),
-        5: (SKELETON_SUB, [SKELETON_CROSS_GATE, SKELETON_VOL_ADJ]),
-        6: (SKELETON_CROSS_GATE, [SKELETON_SIGN_SWITCH, SKELETON_DEEP_CASCADE]),
+        3: (SKELETON_IND_NEUT, [SKELETON_PURE_MULT]),
+        4: (SKELETON_PURE_MULT, [SKELETON_SUB]),
+        5: (SKELETON_SUB, []),
     }
     
     primary_sk, secondary_sks = phase_map.get(rotation_phase, phase_map[0])
@@ -2027,8 +2020,8 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
                 result.append(c)
                 seen_skeletons_in_batch.add(skeleton_type)
     
-    # Phase 0/4/6: primary exploration
-    if (rotation_phase in (0, 4, 6)) and sorted_group(primary_sk):
+    # Phase 0/4: primary exploration
+    if (rotation_phase in (0, 4)) and sorted_group(primary_sk):
         # MULT exhaustion check for phase 0
         if rotation_phase == 0 and mult_exhausted:
             pass  # skip primary, go to secondary
