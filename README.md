@@ -27,7 +27,7 @@ graph TD
 
     %% 1. Orthogonality
     subgraph S1["1️⃣ 正交分析"]
-        O1[fetch_actives]:::action --> O2[字段频率 + AST 骨架 + ratio pattern family<br>(numerator/denominator 追踪)]:::action
+        O1[fetch_actives]:::action --> O2[字段频率 + AST 骨架 + ratio pattern family +<br>field quadruple 四元组追踪 (A/B,C/D)]:::action
         O2 --> O3{active_count ≥ 20?}:::decision
         O3 -->|✅ 是| DONE[🏆 TARGET REACHED]:::endNode
     end
@@ -277,7 +277,14 @@ pv1:          close, volume, adv20, returns, vwap, open, high, low
 
 ---
 
-## 飞书 Bot 推送
+## 变更日志
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v3.16 | 2026-06-02 | **field quadruple → SC 关联模型**：从 pair-family 二阶近似升级为 field-level 四元组追踪。`_extract_field_quadruples()` 提取 `rank(A/B)*rank(C/D)` 的四元组 `(A,B,C,D)`；正交分析追踪所有 ACTIVE 的四元组；候选评分时对共享 field pair 的 MULT 表达式施加 -5（精确重叠）/ -2（部分重叠）/ -8（完全复用）惩罚，更精确地预测 WQ SELF_CORRELATION |
+| v3.15 | 2026-06-02 | SC 轮询卡死 + Session 泄露 + 提交前健康探测 |
+| v3.14 | 2026-06-02 | P7: 骨架旋转结构化计数 + 优先级逆转；P12: _strip_last_term paren-depth 扫描 |
+| v3.13 | 2026-06-02 | P0-P2 六项修复：正向激励→反向激励、ratio pattern 嵌套支持、SELF_CORRELATION 四元组频率追踪、pure_mult 字段重叠放宽、骨架旋转结构化分类 |
 
 - 事件：IS/SC 通过、调参成功、新 ACTIVE、调参耗尽、流水线错误
 - 零 LLM Token 成本（纯 Bot API）
