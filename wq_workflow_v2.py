@@ -2849,10 +2849,17 @@ class Workflow:
             field_usage = ortho["fields_used"]
             used_pairs = ortho.get("field_pairs_used", set())
 
-            denoms = ["cap", "high", "open", "low", "sales", "enterprise_value", "equity"]
+            # Only use proven denominators — no zero-coverage fields (sales → S=None)
+            # and respect time-frequency compatibility (pv1×fund mixing → S=None)
+            fund_denoms = ["cap", "enterprise_value", "equity"]
+            pv1_denoms = ["close", "volume", "adv20", "vwap", "low", "high", "open"]
+            denoms = fund_denoms + pv1_denoms
             denoms = [d for d in denoms if field_usage.get(d, 0) <= 2]
 
-            nums = [f for f in ALL_WQ_FIELDS if field_usage.get(f, 0) <= 1]
+            fund_nums = ["revenue", "operating_income", "debt"]
+            pv1_nums = ["returns", "volume", "low", "high"]
+            nums = fund_nums + pv1_nums
+            nums = [n for n in nums if field_usage.get(n, 0) <= 1]
             nums = [n for n in nums if n not in ["close"]]  # exclude close (too common)
 
             mom_pool = [
@@ -2870,6 +2877,11 @@ class Workflow:
                     pair = frozenset([num, den])
                     if pair in used_pairs:
                         continue
+                    # Time-frequency compatibility: don't mix pv1 num with fund den or vice versa
+                    g1 = "fund" if num in FUND_FIELDS else "pv1"
+                    g2 = "fund" if den in FUND_FIELDS else "pv1"
+                    if g1 != g2:
+                        continue
                     
                     for num2 in nums[:6]:
                         if num2 == num:
@@ -2880,6 +2892,11 @@ class Workflow:
                             pair2 = frozenset([num2, den2])
                             # Ensure no field overlap between the two ratios
                             if {num, den} & {num2, den2}:
+                                continue
+                            # Time-frequency compatibility for second pair
+                            g1b = "fund" if num2 in FUND_FIELDS else "pv1"
+                            g2b = "fund" if den2 in FUND_FIELDS else "pv1"
+                            if g1b != g2b:
                                 continue
                             
                             for (mom, mom_name) in mom_pool[:2]:

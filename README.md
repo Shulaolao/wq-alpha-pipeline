@@ -181,7 +181,8 @@ wq-alpha-pipeline/
 │   ├── Audit4: 骨架优先级逆转 — 稀有+2 bonus
 │   ├── P6(审计): pure_mult 放宽字段重叠
 │   ├── P7(审计): 结构化骨架计数替代 regex
-│   └── P0(6489980): 凭据安全 — 删除硬编码 WQ_PASS/DEEPSEEK_API_KEY
+│   ├── P0(6489980): 凭据安全 — 删除硬编码 WQ_PASS/DEEPSEEK_API_KEY
+│   ├── P13(2026-06-02): SC 调参 field pair 裂缝 — sales死字段/时频不兼容/_generate_new_ratio_variations 不同步
 ├── scripts/
 │   └── wq_pipeline.py              # 旧版三阶段流水线（已废弃）
 ├── config/
@@ -266,6 +267,16 @@ _strip_last_term() 演进路线：
 
 旧版仅检测 0% 停滞。新版检测**任意进度停滞**（35%/15% 也触发），加速发现卡死并切换到 DIRECT_RANK 优先模式。
 
+### SC 调参 field pair 裂缝修复（P13 / v3.18）
+
+`_tune_and_retry()` SC 失败分支的 field pair 生成有三项裂缝：
+
+1. **`sales` 死字段**：零覆盖率 S=None，不应进入任何生成池
+2. **时频兼容性缺失**：pv1 num × fund den → S=None，必须拆分 fund/pv1 子池
+3. **与 `_generate_new_ratio_variations` 不同步**：后者已有时频过滤，前者没有
+
+修复：denoms/nums 拆分为 fund/pv1 子池，pair 生成时通过 `FUND_FIELDS` 分组检查，确保 num/den 同组。
+
 ---
 
 ## 已验证 WQ 字段（17 个）
@@ -282,7 +293,7 @@ pv1:          close, volume, adv20, returns, vwap, open, high, low
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-|| v3.17 | 2026-06-02 | **SC 回归模型 + S=None 裂缝修复**：① `quadruple_sc_stats` 表收集每个四元组的历史 SC pass/fail 比率，`get_quad_sc_penalty()` 在正交评分中施加数据驱动惩罚（<3 样本无惩罚 / pass_rate≥0.7 无惩罚 / 0.5-0.7 扣 1 / <0.5 扣 3）；② `record_quadruple_sc()` 在 SC 结果产出时自动记录四元组→SC 结果对；③ `_tune_and_retry` S=None 从 `break` 改为 `continue`，避免错误放弃同批次中可能存活的其他字段组合变体 |
+|| v3.18 | 2026-06-02 | **_tune_and_retry SC 失败分支 field pair 生成修复（3 项裂缝）**：① 移除 `sales`（零覆盖率 S=None 死字段）；② 新增时间频率兼容性检查（pv1 num × fund den → S=None），将 denoms/nums 拆分为 fund/ pv1 两个子池分别过滤；③ 与 `_generate_new_ratio_variations` 逻辑同步（二者均使用 `FUND_FIELDS` 分组 + time-frequency 过滤） |
 || v3.16 | 2026-06-02 | **field quadruple → SC 关联模型**：从 pair-family 二阶近似升级为 field-level 四元组追踪。`_extract_field_quadruples()` 提取 `rank(A/B)*rank(C/D)` 的四元组 `(A,B,C,D)`；正交分析追踪所有 ACTIVE 的四元组；候选评分时对共享 field pair 的 MULT 表达式施加 -5（精确重叠）/ -2（部分重叠）/ -8（完全复用）惩罚，更精确地预测 WQ SELF_CORRELATION |
 | v3.15 | 2026-06-02 | SC 轮询卡死 + Session 泄露 + 提交前健康探测 |
 | v3.14 | 2026-06-02 | P7: 骨架旋转结构化计数 + 优先级逆转；P12: _strip_last_term paren-depth 扫描 |
