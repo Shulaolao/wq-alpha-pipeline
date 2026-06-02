@@ -8,18 +8,6 @@ interface CandidateCardProps {
   batchTotal?: number;
 }
 
-function highlightExpr(expr: string) {
-  if (!expr) return '<span class="text-gray-600">—</span>';
-  const fieldRx = /\b(revenue|enterprise_value|debt|equity|operating_income|ebitda|cap|cash|sales|close|volume|adv20|returns|vwap|open|high|low)\b/g;
-  const kwRx = /\b(rank|ts_mean|ts_sum|ts_std|ts_corr|ts_rank|ts_min|ts_max|ts_delta|ts_zscore|log|sign|abs|scale|group_rank|zscore|max|min|clip|ind_neutral|sector_neutral)\b/g;
-  let html = expr.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  html = html.replace(fieldRx, '<span class="syntax-field">$1</span>');
-  html = html.replace(kwRx, '<span class="syntax-op">$1</span>');
-  html = html.replace(/[()*+\-]/g, '<span class="syntax-paren">$&</span>');
-  html = html.replace(/\b\d+\.?\d*\b/g, '<span class="syntax-num">$&</span>');
-  return html;
-}
-
 export default function CandidateCard({ candidate, batchIndex, batchTotal }: CandidateCardProps) {
   if (!candidate) return null;
 
@@ -42,10 +30,9 @@ export default function CandidateCard({ candidate, batchIndex, batchTotal }: Can
         )}
       </div>
 
-      <div
-        className="font-mono text-sm bg-dark-900/80 rounded-lg p-3 border border-white/[0.04] leading-relaxed"
-        dangerouslySetInnerHTML={{ __html: highlightExpr(candidate.expr || '') }}
-      />
+      <pre className="font-mono text-sm bg-dark-900/80 rounded-lg p-3 border border-white/[0.04] leading-relaxed overflow-x-auto whitespace-pre-wrap text-zinc-200">
+        {candidate.expr || '—'}
+      </pre>
 
       <div className="grid grid-cols-3 gap-3 mt-3">
         {/* IS Status */}
@@ -117,13 +104,6 @@ export default function CandidateCard({ candidate, batchIndex, batchTotal }: Can
           </div>
         </div>
       </div>
-
-      <style jsx>{`
-        .syntax-field { color: #818cf8; }
-        .syntax-op { color: #34d399; }
-        .syntax-num { color: #fbbf24; }
-        .syntax-paren { color: #6b7280; }
-      `}</style>
     </div>
   );
 }

@@ -66,11 +66,63 @@
   --font-mono: var(--font-mono);
 }
 
-/* ─── Card component style ─── */
+/* ─── Custom animations ─── */
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes border-glow {
+  0%, 100% { border-color: rgba(99, 102, 241, 0.15); }
+  50% { border-color: rgba(99, 102, 241, 0.4); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Skeleton loader ─── */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    rgba(255,255,255,0.03) 25%,
+    rgba(255,255,255,0.06) 50%,
+    rgba(255,255,255,0.03) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 0.375rem;
+}
+
+/* ─── Glass card effect ─── */
 .card {
   background-color: var(--surface);
   border: var(--border-subtle);
   border-radius: 0.75rem;
+  transition: border-color 0.3s ease;
+}
+.card:hover {
+  border-color: rgba(99, 102, 241, 0.2);
+}
+
+/* ─── Section divider ─── */
+.section-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.section-header::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--surface-border), transparent);
 }
 
 /* ─── Base body ─── */
@@ -134,4 +186,18 @@ html {
   :root {
     --bg-primary: #08080e;
   }
+}
+
+/* ─── Custom animations ─── */
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* ─── Stat card ─── */
+.stat-card {
+  background-color: rgba(18, 18, 31, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
 }

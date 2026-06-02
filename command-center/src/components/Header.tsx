@@ -22,19 +22,19 @@ export interface HeaderProps {
 
 function Logo() {
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center gap-1.5 md:gap-2 shrink-0">
       {/* WQ logomark — styled monogram */}
-      <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-sky-500 to-indigo-600 text-xs font-bold tracking-tight text-white shadow-sm">
+      <span className="flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg bg-gradient-to-br from-sky-500 to-indigo-600 text-[10px] md:text-xs font-bold tracking-tight text-white shadow-sm">
         WQ
       </span>
-      <span className="hidden text-sm font-semibold tracking-tight text-zinc-100 sm:inline-block">
+      <span className="hidden text-xs md:text-sm font-semibold tracking-tight text-zinc-100 sm:inline-block">
         Command Center
       </span>
     </div>
   );
 }
 
-function StatusDot({ status }: { status: Status }) {
+function StatusDot({ status, label }: { status: Status; label?: boolean }) {
   const colors: Record<Status, string> = {
     running: 'bg-emerald-500 shadow-[0_0_6px_theme(colors.emerald.500/0.6)]',
     paused: 'bg-amber-400 shadow-[0_0_6px_theme(colors.amber.400/0.6)]',
@@ -50,15 +50,33 @@ function StatusDot({ status }: { status: Status }) {
   };
 
   return (
-    <div className="flex items-center gap-1.5" title={labels[status]}>
-      <span className={`inline-block h-2.5 w-2.5 rounded-full ${colors[status]}`} />
-      <span className="text-xs font-medium text-zinc-400">{labels[status]}</span>
+    <div className="flex items-center gap-1" title={labels[status]}>
+      <span className={`inline-block h-2 w-2 md:h-2.5 md:w-2.5 rounded-full ${colors[status]}`} />
+      {label !== false && (
+        <span className="text-[10px] md:text-xs font-medium text-zinc-400">{labels[status]}</span>
+      )}
     </div>
   );
 }
 
-function ActiveCount({ count, target }: { count: number; target: number }) {
+function ActiveCount({ count, target, compact }: { count: number; target: number; compact?: boolean }) {
   const pct = target > 0 ? Math.min((count / target) * 100, 100) : 0;
+
+  if (compact) {
+    return (
+      <div className="flex items-center gap-1.5">
+        <span className="text-[11px] font-semibold tabular-nums text-zinc-100 whitespace-nowrap">
+          {count}<span className="font-normal text-zinc-500">/{target}</span>
+        </span>
+        <div className="h-1.5 w-16 overflow-hidden rounded-full bg-zinc-800">
+          <div
+            className="h-full rounded-full bg-gradient-to-r from-sky-500 to-indigo-500 transition-all duration-500 ease-out"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-1">
@@ -71,7 +89,6 @@ function ActiveCount({ count, target }: { count: number; target: number }) {
           <span className="font-normal text-zinc-500">/{target}</span>
         </span>
       </div>
-      {/* progress bar */}
       <div className="h-1.5 w-28 overflow-hidden rounded-full bg-zinc-800">
         <div
           className="h-full rounded-full bg-gradient-to-r from-sky-500 to-indigo-500 transition-all duration-500 ease-out"
@@ -84,9 +101,8 @@ function ActiveCount({ count, target }: { count: number; target: number }) {
 
 function PhaseBadge({ phase }: { phase: string }) {
   if (!phase) return null;
-
   return (
-    <span className="inline-flex items-center rounded-full border border-zinc-700/60 bg-zinc-800/60 px-2.5 py-0.5 text-[11px] font-medium tracking-wide text-zinc-300 backdrop-blur-sm">
+    <span className="inline-flex items-center rounded-full border border-zinc-700/60 bg-zinc-800/60 px-1.5 md:px-2.5 py-0.5 text-[9px] md:text-[11px] font-medium tracking-wide text-zinc-300 backdrop-blur-sm whitespace-nowrap">
       {phase}
     </span>
   );
@@ -113,9 +129,9 @@ function RefreshSelect({
   );
 
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-1">
       <svg
-        className="h-3.5 w-3.5 text-zinc-500"
+        className="h-3 w-3 md:h-3.5 md:w-3.5 text-zinc-500 shrink-0"
         fill="none"
         viewBox="0 0 24 24"
         stroke="currentColor"
@@ -130,7 +146,7 @@ function RefreshSelect({
       <select
         value={value}
         onChange={handleChange}
-        className="appearance-none rounded-md border border-zinc-700 bg-zinc-800/80 px-2 py-1 text-[11px] font-medium text-zinc-300 outline-none ring-0 transition-colors hover:border-zinc-600 focus:border-zinc-500"
+        className="appearance-none rounded-md border border-zinc-700 bg-zinc-800/80 px-1.5 md:px-2 py-0.5 md:py-1 text-[10px] md:text-[11px] font-medium text-zinc-300 outline-none ring-0 transition-colors hover:border-zinc-600 focus:border-zinc-500"
       >
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>
@@ -156,11 +172,13 @@ export default function Header({
   onRefreshIntervalChange,
 }: HeaderProps) {
   return (
-    <header className="flex w-full items-center justify-between border-b border-zinc-800/80 bg-zinc-900/80 px-4 py-2.5 backdrop-blur-md sm:px-6">
-      {/* Left: Logo + status */}
-      <div className="flex items-center gap-4">
+    <header className="flex w-full items-center justify-between border-b border-zinc-800/80 bg-zinc-900/80 px-3 md:px-6 py-2 md:py-2.5 backdrop-blur-md gap-2">
+      {/* Left: Logo */}
+      <div className="flex items-center gap-2 md:gap-4 min-w-0">
         <Logo />
-        <div className="hidden items-center gap-3 sm:flex">
+
+        {/* Desktop extras */}
+        <div className="hidden md:flex items-center gap-3">
           <StatusDot status={status} />
           <PhaseBadge phase={phase} />
           {duration && (
@@ -186,10 +204,13 @@ export default function Header({
       </div>
 
       {/* Right: active count + refresh */}
-      <div className="flex items-center gap-5">
-        {/* Active count (hidden on very small screens) */}
-        <div className="hidden xs:block sm:block">
+      <div className="flex items-center gap-2 md:gap-5 shrink-0">
+        {/* Active count — compact on mobile, full on desktop */}
+        <div className="hidden sm:block">
           <ActiveCount count={activeCount} target={target} />
+        </div>
+        <div className="sm:hidden">
+          <ActiveCount count={activeCount} target={target} compact />
         </div>
 
         {/* Refresh interval selector */}
@@ -197,9 +218,9 @@ export default function Header({
           <RefreshSelect value={refreshInterval} onChange={onRefreshIntervalChange} />
         )}
 
-        {/* Mobile status row */}
-        <div className="flex items-center gap-2 sm:hidden">
-          <StatusDot status={status} />
+        {/* Mobile-only status indicator */}
+        <div className="flex items-center gap-1 md:hidden">
+          <StatusDot status={status} label={false} />
           <PhaseBadge phase={phase} />
         </div>
       </div>

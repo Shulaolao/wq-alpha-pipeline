@@ -19,12 +19,12 @@ export default function ActivityLog({ entries }: ActivityLogProps) {
 
   useEffect(() => {
     if (entries.length > prevLength.current && containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+      containerRef.current.scrollTop = 0;
     }
     prevLength.current = entries.length;
   }, [entries.length]);
 
-  const rendered = useMemo(() => entries.slice(-100), [entries]);
+  const rendered = useMemo(() => entries.slice(-100).reverse(), [entries]);
 
   return (
     <div className="card p-4">
