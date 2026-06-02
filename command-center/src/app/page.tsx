@@ -5,7 +5,7 @@ import type { PipelineStatus } from '@/types/dashboard';
 import type { HistoryEvent, AlphaSummary } from '@/services/api';
 import { fetchStatus, fetchHistory, fetchOrthogonality, fetchCompleteAlphas } from '@/services/api';
 import Header from '@/components/Header';
-import PipelineVisualizer from '@/components/PipelineVisualizer';
+import WorkflowGraph from '@/components/WorkflowGraph';
 import PipelineStats from '@/components/PipelineStats';
 import CandidateCard from '@/components/CandidateCard';
 import ActivityLog from '@/components/ActivityLog';
@@ -80,9 +80,12 @@ export default function DashboardPage() {
       />
 
       {/* Pipeline Visualizer */}
-      <PipelineVisualizer
+      <WorkflowGraph
         phase={status?.phase || 'init'}
-        simProgress={status?.current_candidate?.sim_progress}
+        activeCount={status?.active_count}
+        target={status?.target}
+        batchIndex={status?.batch_index}
+        batchTotal={status?.batch_total}
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-7 gap-4">
