@@ -199,6 +199,10 @@ def _get_status_data():
             data["candidates_passed_sc"] = cumulative["total_sc_pass"]
         if cumulative.get("total_submitted", 0) > data["candidates_submitted"]:
             data["candidates_submitted"] = cumulative["total_submitted"]
+    # Expose failure counters directly
+    data["candidates_is_fail"] = cumulative.get("total_is_fail", 0) if cumulative else 0
+    data["candidates_sc_fail"] = cumulative.get("total_sc_fail", 0) if cumulative else 0
+    data["candidates_failed"] = cumulative.get("total_failed", 0) if cumulative else 0
     _status_cache["data"] = data
     _status_cache["ts"] = now
     return dict(_status_cache["data"])
@@ -346,9 +350,9 @@ def api_orthogonality():
 
 @app.route("/api/history")
 def api_history():
-    # Primary: read from SQLite
+    # Primary: read flat events from SQLite
     try:
-        result = wq_db.get_all_alpha_history(limit=200)
+        result = wq_db.get_alpha_history_flat(limit=200)
         if result["total"] > 0:
             return jsonify(result)
     except Exception as e:
@@ -505,7 +509,7 @@ def api_alphas_history():
     try:
         limit = int(request.args.get("limit", 200))
         offset = int(request.args.get("offset", 0))
-        data = wq_db.get_all_alpha_history(limit=limit, offset=offset)
+        data = wq_db.get_alpha_history_flat(limit=limit, offset=offset)
         # Rename "events" key to "alphas" for frontend compat
         return jsonify({
             "total": data["total"],
@@ -523,6 +527,17 @@ def api_alphas_submitted():
             "total": len(alphas),
             "alphas": alphas,
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/alphas/complete")
+def api_alphas_complete():
+    """Get all alphas with full lifecycle summary and state chain."""
+    try:
+        limit = int(request.args.get("limit", 200))
+        offset = int(request.args.get("offset", 0))
+        result = wq_db.get_all_alphas_summary(limit=limit, offset=offset)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

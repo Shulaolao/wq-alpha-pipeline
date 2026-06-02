@@ -1,8 +1,9 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { PipelineStatus, HistoryEvent } from '@/types/dashboard';
-import { fetchStatus, fetchHistory, fetchOrthogonality } from '@/services/api';
+import type { PipelineStatus } from '@/types/dashboard';
+import type { HistoryEvent, AlphaSummary } from '@/services/api';
+import { fetchStatus, fetchHistory, fetchOrthogonality, fetchCompleteAlphas } from '@/services/api';
 import Header from '@/components/Header';
 import PipelineVisualizer from '@/components/PipelineVisualizer';
 import PipelineStats from '@/components/PipelineStats';
@@ -12,27 +13,33 @@ import ActiveAlphas from '@/components/ActiveAlphas';
 import FieldHeatmap from '@/components/FieldHeatmap';
 import OrthogonalityGraph from '@/components/OrthogonalityGraph';
 import Timeline from '@/components/Timeline';
+import AlphaCompleteList from '@/components/AlphaCompleteList';
 
 export default function DashboardPage() {
   const [status, setStatus] = useState<PipelineStatus | null>(null);
   const [history, setHistory] = useState<HistoryEvent[]>([]);
   const [historyTotal, setHistoryTotal] = useState(0);
   const [orthData, setOrthData] = useState<{ nodes: any[]; edges: any[]; node_count: number; edge_count: number } | null>(null);
+  const [completeAlphas, setCompleteAlphas] = useState<AlphaSummary[]>([]);
+  const [completeAlphasTotal, setCompleteAlphasTotal] = useState(0);
   const [refreshMs, setRefreshMs] = useState(10000);
   const [errors, setErrors] = useState<string[]>([]);
   const phaseStartRef = useRef(Date.now());
 
   const loadData = useCallback(async () => {
     try {
-      const [s, h, o] = await Promise.all([
+      const [s, h, o, c] = await Promise.all([
         fetchStatus(),
         fetchHistory(),
         fetchOrthogonality(),
+        fetchCompleteAlphas(),
       ]);
       setStatus(s);
       setHistory(h.events || []);
       setHistoryTotal(h.total || 0);
       setOrthData(o);
+      setCompleteAlphas(c.alphas || []);
+      setCompleteAlphasTotal(c.total || 0);
       if (s.errors?.length) setErrors(s.errors.slice(-3));
     } catch (err) {
       console.error('Poll failed:', err);
@@ -106,12 +113,15 @@ export default function DashboardPage() {
 
         {/* RIGHT: 3/7 */}
         <div className="lg:col-span-3 space-y-4">
-          {/* Pipeline Stats */}
+          {/* Pipeline Stats — now with failure counters */}
           <PipelineStats
             generated={status?.candidates_generated ?? 0}
             isPassed={status?.candidates_passed_is ?? 0}
+            isFail={status?.candidates_is_fail ?? 0}
             scPassed={status?.candidates_passed_sc ?? 0}
+            scFail={status?.candidates_sc_fail ?? 0}
             submitted={status?.candidates_submitted ?? 0}
+            failed={status?.candidates_failed ?? 0}
             iterations={status?.iterations ?? 0}
             lastUpdated={status?.last_updated || ''}
             duration={status?.duration ?? undefined}
@@ -146,6 +156,9 @@ export default function DashboardPage() {
           <Timeline events={history} total={historyTotal} />
         </div>
       </div>
+
+      {/* Alpha Complete List — full-width at bottom */}
+      <AlphaCompleteList alphas={completeAlphas} total={completeAlphasTotal} />
     </div>
   );
 }

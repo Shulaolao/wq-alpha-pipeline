@@ -23,7 +23,7 @@ WQ 工作流 v2 — 单进程全链路自适应流水线
 import json, time, sys, os, ssl, re, signal, logging, traceback, hashlib
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+from typing import Optional, Any, Tuple
 
 # ═══ Auto-load .env from home directory ═══
 # ⚠️ MUST use os.path.expanduser() not Path.home() — launchd does NOT set HOME env var
@@ -1556,11 +1556,12 @@ def adaptive_poll(session, url: str, poll_name: str,
                    success_condition, max_wait: int = 1800,
                    initial_interval: float = 10,
                    fallback_interval: float = 60,
-                   stuck_threshold: int = 0) -> Optional[Any]:
+                   stuck_threshold: int = 0) -> Tuple[Optional[Any], requests.Session]:
     """
     Adaptive polling: fast at first, slow down over time.
     stuck_threshold: if > 0 and progress stays at 0 for this many secs, abort.
-    Returns the value from success_condition when met, or None on timeout/stuck.
+    Returns (value from success_condition when met, or None) and the session object
+    (potentially refreshed if SSL/connection errors were encountered).
     """
     start = time.time()
     interval = initial_interval
@@ -1588,7 +1589,7 @@ def adaptive_poll(session, url: str, poll_name: str,
                 result = success_condition(data)
                 if result is not None:
                     log(f"✅ {poll_name}: resolved in {elapsed:.0f}s")
-                    return result
+                    return result, session
                 
                 # Log progress if available
                 pct = data.get("progress", 0)
@@ -1609,7 +1610,7 @@ def adaptive_poll(session, url: str, poll_name: str,
                             stuck_since = time.time()
                         elif time.time() - stuck_since > stuck_threshold:
                             log(f"❌ {poll_name}: stuck at {current_progress*100:.0f}% for {stuck_threshold}s, aborting", "error")
-                            return None
+                            return None, session
                     else:
                         stuck_since = None
                         last_progress = current_progress
@@ -1658,7 +1659,7 @@ def adaptive_poll(session, url: str, poll_name: str,
         time.sleep(interval)
     
     log(f"❌ {poll_name}: TIMEOUT ({max_wait}s)", "error")
-    return None
+    return None, session
 
 
 # ═══ Notification — ZERO LLM tokens, pure HTTP POST ══
@@ -2060,7 +2061,7 @@ class Workflow:
         def quick_ready(data):
             return data.get("alpha") if data.get("alpha") else None
 
-        alpha_id = adaptive_poll(
+        alpha_id, self.s = adaptive_poll(
             self.s, f"{API}/simulations/{sim_id}",
             f"Quick {cand['name']}",
             quick_ready, max_wait=600,
@@ -2133,7 +2134,7 @@ class Workflow:
                 return alpha_id
             return None
 
-        alpha_id = adaptive_poll(
+        alpha_id, self.s = adaptive_poll(
             self.s, f"{API}/simulations/{sim_id}",
             f"IS {cand['name']}",
             is_ready, max_wait=3600,
@@ -2218,6 +2219,18 @@ class Workflow:
         
         log(f"📬 Submitting SC for {alpha_id}...")
         
+        # ── Pre-batch health probe (Directive 3) ──
+        # Skip probe on re-submissions (tune retries) — only probe on first SC attempt
+        if cand.get("_sc_attempt", 1) == 1:
+            probe = self.probe_wq_queue_health()
+            congestion = probe.get("congestion", "moderate")
+            delay = probe.get("recommended_delay_sec", 120)
+            if delay > 0:
+                log(f"⏸️ SC queue {congestion}, delaying {delay}s before submit", "warn")
+                time.sleep(delay)
+            else:
+                log(f"✅ SC queue healthy, proceeding immediately")
+        
         try:
             r = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
         except Exception as e:
@@ -2264,12 +2277,32 @@ class Workflow:
                 return {"result": "PASS", "value": 0}
             return None
         
-        sc_result = adaptive_poll(
+        sc_result, self.s = adaptive_poll(
             self.s, f"{API}/alphas/{alpha_id}",
             f"SC {cand['name']}",
-            sc_ready, max_wait=14400,  # 4h — WQ SC can take up to 4h on busy accounts
-            initial_interval=30, fallback_interval=120
+            sc_ready, max_wait=7200,  # 2h (was 4h) — reduce wall-clock waste
+            initial_interval=30, fallback_interval=120,
+            stuck_threshold=1800  # abort if stuck at same progress for 30 min
         )
+        
+        # Handle early abort from stuck detection
+        if sc_result is None:
+            # Distinguish timeout vs stuck: check if progress ever moved
+            # conservative: treat as TIMEOUT_PENDING (non-fatal)
+            log(f"⏸️ SC for {cand['name']} aborted/stuck, marking as SC_TIMEOUT_PENDING", "warn")
+            cand["sc_result"] = "SC_TIMEOUT_PENDING"
+            _wqdb.record_alpha_event(
+                name=cand.get("name", ""), expr=cand.get("expr", ""),
+                event_type="sc_timeout_pending",
+                alpha_id=alpha_id,
+                sharpe=cand.get("sharpe"),
+                fitness=cand.get("fitness"),
+                sc_result="SC_TIMEOUT_PENDING",
+                phase="sc_submit"
+            )
+            notify(f"SC卡住延期 ⏸️ {cand['name']} (排队拥堵/进度停滞，2h后重试)\nS={cand.get('sharpe')} SC=pending",
+                   emoji="⏸️", dedup_key=f"sc_pending_{alpha_id}")
+            return False  # graceful, don't crash main loop
         
         if not sc_result:
             # Try 403 probe as fallback — probe the alpha to get SC result
@@ -2319,6 +2352,126 @@ class Workflow:
             notify(f"SC通过 ✅ {cand['name']}\nSC={cand['sc_value']}\n{cand['expr'][:60]}",
                    emoji="✅", dedup_key=f"sc_{cand.get('alpha_id','')}")
         return is_pass
+    
+    def probe_wq_queue_health(self, max_tries: int = 3) -> dict:
+        """
+        Pre-SC-submission health probe: checks WQ SC queue congestion state.
+        
+        Strategy: submit a tiny sim (1-day backtest period) to measure how long
+        the sim itself takes to resolve. Fast resolution = queue healthy.
+        Slow resolution = SC queue likely congested.
+        
+        Returns dict with keys:
+            - congestion: "healthy" | "moderate" | "severe"
+            - sim_resolution_sec: float or None
+            - recommended_delay_sec: int
+        """
+        log("🔍 Pre-SC health probe: checking WQ queue state...")
+        
+        probe_payload = {
+            "type": "REGULAR",
+            "regular": "rank(ts_delta(close, 1)) / ts_mean(volume, 5)",  # trivial expr
+            "settings": {
+                "backtest": {"start": "2025-01-01", "end": "2025-01-02"},  # 1 day
+                "universe": "MID_CAP_US_1000",
+                "long_only": False
+            }
+        }
+        
+        start = time.time()
+        for attempt in range(1, max_tries + 1):
+            try:
+                r = self.s.post(f"{API}/simulations", json=probe_payload, timeout=90)
+                if r.status_code == 401:
+                    log("⚠️ 401 on probe, refreshing session...", "warn")
+                    self.s = fresh_session()
+                    _last_auth_time = time.time()
+                    continue
+                
+                if r.status_code in (200, 201, 202):
+                    sim_id = r.headers.get("Location", "").split("/")[-1]
+                    if not sim_id:
+                        # Parse from response body as fallback
+                        try:
+                            sim_id = r.json().get("id", "")
+                        except:
+                            pass
+                    
+                    if sim_id:
+                        # Poll for sim resolution
+                        def probe_ready(data):
+                            return data.get("alpha") if data.get("alpha") else None
+                        
+                        result, self.s = adaptive_poll(
+                            self.s, f"{API}/simulations/{sim_id}",
+                            "Probe sim",
+                            probe_ready, max_wait=300,  # 5 min max for probe
+                            initial_interval=5, fallback_interval=15,
+                            stuck_threshold=60  # abort if stuck > 60s
+                        )
+                        resolution_time = time.time() - start
+                        
+                        if result:
+                            # Sim resolved — infer queue state
+                            if resolution_time < 30:
+                                congestion = "healthy"
+                                delay = 0
+                            elif resolution_time < 120:
+                                congestion = "moderate"
+                                delay = 120
+                            else:
+                                congestion = "severe"
+                                delay = 600
+                            
+                            log(f"🔍 Probe resolved in {resolution_time:.0f}s → {congestion} (delay={delay}s)")
+                            return {
+                                "congestion": congestion,
+                                "sim_resolution_sec": resolution_time,
+                                "recommended_delay_sec": delay,
+                                "sim_id": sim_id,
+                                "alpha_id": result
+                            }
+                        else:
+                            log(f"⚠️ Probe sim timed out ({resolution_time:.0f}s), queue likely severe")
+                            return {
+                                "congestion": "severe",
+                                "sim_resolution_sec": resolution_time,
+                                "recommended_delay_sec": 600,
+                                "sim_id": sim_id,
+                                "alpha_id": None
+                            }
+                
+                elif r.status_code == 429:
+                    retry = int(r.headers.get("Retry-After", 60))
+                    log(f"⚠️ 429 on probe, waiting {retry}s", "warn")
+                    time.sleep(retry)
+                    continue
+                
+                else:
+                    log(f"⚠️ Probe HTTP {r.status_code}, retry {attempt}/{max_tries}")
+                    time.sleep(10 * attempt)
+                    
+            except Exception as e:
+                log(f"⚠️ Probe attempt {attempt}/{max_tries} error: {e}", "warn")
+                if attempt < max_tries:
+                    time.sleep(10 * attempt)
+                else:
+                    log(f"❌ Probe failed after {max_tries} attempts, defaulting to moderate", "error")
+                    return {
+                        "congestion": "moderate",
+                        "sim_resolution_sec": None,
+                        "recommended_delay_sec": 120,
+                        "sim_id": None,
+                        "alpha_id": None
+                    }
+        
+        return {
+            "congestion": "moderate",
+            "sim_resolution_sec": None,
+            "recommended_delay_sec": 120,
+            "sim_id": None,
+            "alpha_id": None
+        }
     
     def _submit_alpha(self, cand: dict, alpha_id: str):
         """Submit the alpha to formal pool"""
@@ -2692,7 +2845,7 @@ class Workflow:
                 aid = data.get("alpha")
                 return aid if aid else None
             
-            alpha_id = adaptive_poll(
+            alpha_id, self.s = adaptive_poll(
                 self.s, f"{API}/simulations/{sim_id}",
                 f"Tune IS {var['name']}",
                 is_ready, max_wait=3600,

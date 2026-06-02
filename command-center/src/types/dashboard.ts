@@ -56,6 +56,9 @@ export interface PipelineStatus {
   candidates_passed_is: number;
   candidates_passed_sc: number;
   candidates_submitted: number;
+  candidates_is_fail: number;
+  candidates_sc_fail: number;
+  candidates_failed: number;
   iterations: number;
   errors: string[];
   field_chart: FieldUsage[];
