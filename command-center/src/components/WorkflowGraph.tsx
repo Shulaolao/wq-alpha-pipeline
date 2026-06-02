@@ -149,9 +149,10 @@ function getPhaseEmoji(phase: string): string {
 // Build row layout for G6
 function getScaledLayout(width: number) {
   const isCompact = width < 640;
-  const rowH = isCompact ? 58 : 75;
+  // Increased spacing to prevent overlap
+  const rowH = isCompact ? 78 : 110;
   const marginX = isCompact ? 36 : 72;
-  const marginY = isCompact ? 8 : 14;
+  const marginY = isCompact ? 10 : 18;
 
   const NODE_LAYOUT_Y: Record<string, number> = {
     'org_ortho': 0, 'dec_active20': 0, 'done': 0,
@@ -171,21 +172,53 @@ function getScaledLayout(width: number) {
     rowLayout[row].push(n.id);
   }
 
-  const nodePositions: Record<string, { x: number; y: number }> = {};
+  // For rows with many nodes, split into two sub-rows for horizontal spacing
+  const splitRowLayout: Record<number, string[]> = {};
   for (const [rowStr, ids] of Object.entries(rowLayout)) {
     const row = Number(rowStr);
+    // Split wide rows into sub-groups
+    if (ids.length > 5) {
+      const mid = Math.ceil(ids.length / 2);
+      for (let i = 0; i < ids.length; i++) {
+        const subRow = row * 10 + (i < mid ? 0 : 1); // e.g. 30 or 31
+        if (!splitRowLayout[subRow]) splitRowLayout[subRow] = [];
+        splitRowLayout[subRow].push(ids[i]);
+      }
+    } else if (ids.length > 3) {
+      // Split into two: first half on main row, rest on sub-row
+      const mid = Math.ceil(ids.length / 2);
+      const firstHalf = ids.slice(0, mid);
+      const secondHalf = ids.slice(mid);
+      if (!splitRowLayout[row * 10]) splitRowLayout[row * 10] = firstHalf;
+      if (secondHalf.length > 0) {
+        const subRow = row * 10 + 1;
+        if (!splitRowLayout[subRow]) splitRowLayout[subRow] = [];
+        splitRowLayout[subRow] = secondHalf;
+      }
+    } else {
+      if (!splitRowLayout[row]) splitRowLayout[row] = [];
+      splitRowLayout[row].push(...ids);
+    }
+  }
+
+  const nodePositions: Record<string, { x: number; y: number }> = {};
+  for (const [rowStr, ids] of Object.entries(splitRowLayout)) {
+    const row = Number(rowStr);
+    const displayRow = Math.floor(row / 10);
+    const subRow = row % 10;
     const count = ids.length;
     const usableWidth = width - marginX * 2;
     const spacing = count > 1 ? usableWidth / (count - 1) : 0;
+    const rowY = marginY + (displayRow * 2 + subRow) * (rowH / 3); // use finer vertical resolution
     ids.forEach((id, i) => {
       nodePositions[id] = {
         x: count > 1 ? marginX + spacing * i : width / 2,
-        y: marginY + row * rowH,
+        y: rowY,
       };
     });
   }
 
-  return { nodePositions, isCompact, totalHeight: marginY * 2 + 6 * rowH + 16 };
+  return { nodePositions, isCompact, totalHeight: marginY * 2 + 13 * (rowH / 3) + 16 }; // expanded to cover sub-rows
 }
 
 export default function WorkflowGraph({ phase, activeCount, target, batchIndex, batchTotal }: WorkflowGraphProps) {
@@ -251,25 +284,28 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
       const pos = nodePositions[n.id] || { x: width / 2, y: 0 };
 
       const nodeSize = isCompact
-        ? (n.type === 'decision' ? [12, 12] : [14, 8])
-        : (n.type === 'decision' ? [18, 18] : [20, 12]);
+        ? (n.type === 'decision' ? [28, 28] : [36, 28])
+        : (n.type === 'decision' ? [36, 36] : [44, 32]);
 
       const labelFontSize = isCompact
-        ? (isActive ? 8 : 7)
-        : (isActive ? 10 : 9);
+        ? (isActive ? 10 : 9)
+        : (isActive ? 12 : 11);
 
       const style: Record<string, any> = {
         size: nodeSize,
         fill: colors.fill,
         stroke: colors.stroke,
         lineWidth: isActive ? 2 : 1.2,
-        labelText: isCompact ? n.label : `${n.label}${n.subtitle ? `\n${n.subtitle}` : ''}`,
         labelFill: colors.label,
         labelFontSize,
         labelFontFamily: 'JetBrains Mono, monospace',
         labelFontWeight: isActive ? 700 : 400,
-        labelPlacement: 'center',
-        labelLineHeight: isCompact ? 10 : 13,
+        labelText: `${n.label}${n.subtitle ? `\n${n.subtitle}` : ''}`,
+        labelPlacement: 'top',
+        labelLineHeight: isCompact ? 12 : 15,
+        labelMaxWidth: isCompact ? 100 : 160,
+        labelOffsetX: 0,
+        labelOffsetY: isCompact ? -10 : -14,
       };
 
       return { id: n.id, data: { ...n, isActive }, style: { ...style, x: pos.x, y: pos.y } };
