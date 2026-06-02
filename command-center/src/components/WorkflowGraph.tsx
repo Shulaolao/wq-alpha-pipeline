@@ -146,13 +146,19 @@ function getPhaseEmoji(phase: string): string {
   return emojis[phase] || '⏳';
 }
 
-// Build row layout for G6
+// Build row layout for G6 — three-tier responsive
 function getScaledLayout(width: number) {
-  const isCompact = width < 640;
-  // Increased spacing to prevent overlap
-  const rowH = isCompact ? 78 : 110;
-  const marginX = isCompact ? 36 : 72;
-  const marginY = isCompact ? 10 : 18;
+  // Three tiers: mobile (<640), tablet (640-1024), desktop (>1024)
+  const tier = width < 640 ? 'mobile' : width < 1024 ? 'tablet' : 'desktop';
+
+  // Layout constants per tier
+  const config: Record<string, { rowH: number; marginX: number; marginY: number; nodeW: number; nodeH: number; decisionW: number; decisionH: number; labelFs: number; labelOffY: number; labelLineH: number; labelMaxW: number; edgeLabelFs: number; edgeLabel: boolean; arrowSz: number }> = {
+    mobile:    { rowH: 64, marginX: 24, marginY: 10, nodeW: 32, nodeH: 24, decisionW: 28, decisionH: 28, labelFs: 9, labelOffY: -8, labelLineH: 12, labelMaxW: 80, edgeLabelFs: 5, edgeLabel: false, arrowSz: 3 },
+    tablet:    { rowH: 82, marginX: 48, marginY: 14, nodeW: 42, nodeH: 32, decisionW: 36, decisionH: 36, labelFs: 10, labelOffY: -10, labelLineH: 13, labelMaxW: 120, edgeLabelFs: 6, edgeLabel: true, arrowSz: 4 },
+    desktop:   { rowH: 104, marginX: 80, marginY: 16, nodeW: 54, nodeH: 40, decisionW: 40, decisionH: 40, labelFs: 12, labelOffY: -14, labelLineH: 15, labelMaxW: 160, edgeLabelFs: 7, edgeLabel: true, arrowSz: 5 },
+  };
+  const c = config[tier];
+  const isMobile = tier === 'mobile';
 
   const NODE_LAYOUT_Y: Record<string, number> = {
     'org_ortho': 0, 'dec_active20': 0, 'done': 0,
@@ -207,18 +213,18 @@ function getScaledLayout(width: number) {
     const displayRow = Math.floor(row / 10);
     const subRow = row % 10;
     const count = ids.length;
-    const usableWidth = width - marginX * 2;
+    const usableWidth = width - c.marginX * 2;
     const spacing = count > 1 ? usableWidth / (count - 1) : 0;
-    const rowY = marginY + (displayRow * 2 + subRow) * (rowH / 3); // use finer vertical resolution
+    const rowY = c.marginY + (displayRow * 2 + subRow) * (c.rowH / 3); // finer vertical resolution
     ids.forEach((id, i) => {
       nodePositions[id] = {
-        x: count > 1 ? marginX + spacing * i : width / 2,
+        x: count > 1 ? c.marginX + spacing * i : width / 2,
         y: rowY,
       };
     });
   }
 
-  return { nodePositions, isCompact, totalHeight: marginY * 2 + 13 * (rowH / 3) + 16 }; // expanded to cover sub-rows
+  return { nodePositions, isMobile, tier, totalHeight: c.marginY * 2 + 13 * (c.rowH / 3) + 16 };
 }
 
 export default function WorkflowGraph({ phase, activeCount, target, batchIndex, batchTotal }: WorkflowGraphProps) {
@@ -272,8 +278,13 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
     if (graphRef.current) return; // Already rendered
     graphMounted.current = true;
 
-    const { nodePositions, isCompact, totalHeight } = getScaledLayout(containerWidth);
+    const { nodePositions, isMobile, tier, totalHeight } = getScaledLayout(containerWidth);
     const width = containerWidth;
+    const cLayout = {
+      mobile: { rowH: 64, marginX: 24, marginY: 10, nodeW: 32, nodeH: 24, decisionW: 28, decisionH: 28, labelFs: 9, labelOffY: -8, labelLineH: 12, labelMaxW: 80, edgeLabelFs: 5, edgeLabel: false, arrowSz: 3 },
+      tablet: { rowH: 82, marginX: 48, marginY: 14, nodeW: 42, nodeH: 32, decisionW: 36, decisionH: 36, labelFs: 10, labelOffY: -10, labelLineH: 13, labelMaxW: 120, edgeLabelFs: 6, edgeLabel: true, arrowSz: 4 },
+      desktop: { rowH: 104, marginX: 80, marginY: 16, nodeW: 54, nodeH: 40, decisionW: 40, decisionH: 40, labelFs: 12, labelOffY: -14, labelLineH: 15, labelMaxW: 160, edgeLabelFs: 7, edgeLabel: true, arrowSz: 5 },
+    }[tier]!;
     const height = Math.max(totalHeight, 300);
 
     const activeIds = new Set(ACTIVE_IDS_FOR_PHASE[phase] || ['org_ortho']);
@@ -283,13 +294,12 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
       const colors = isActive ? ACTIVE_COLORS : NODE_COLORS[n.type];
       const pos = nodePositions[n.id] || { x: width / 2, y: 0 };
 
-      const nodeSize = isCompact
-        ? (n.type === 'decision' ? [28, 28] : [36, 28])
-        : (n.type === 'decision' ? [36, 36] : [44, 32]);
+      const nodeSize = [
+        n.type === 'decision' ? cLayout.decisionW : cLayout.nodeW,
+        n.type === 'decision' ? cLayout.decisionH : cLayout.nodeH,
+      ];
 
-      const labelFontSize = isCompact
-        ? (isActive ? 10 : 9)
-        : (isActive ? 12 : 11);
+      const labelFontSize = isActive ? cLayout.labelFs : cLayout.labelFs - 1;
 
       const style: Record<string, any> = {
         size: nodeSize,
@@ -302,10 +312,10 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
         labelFontWeight: isActive ? 700 : 400,
         labelText: `${n.label}${n.subtitle ? `\n${n.subtitle}` : ''}`,
         labelPlacement: 'top',
-        labelLineHeight: isCompact ? 12 : 15,
-        labelMaxWidth: isCompact ? 100 : 160,
+        labelLineHeight: cLayout.labelLineH,
+        labelMaxWidth: cLayout.labelMaxW,
         labelOffsetX: 0,
-        labelOffsetY: isCompact ? -10 : -14,
+        labelOffsetY: cLayout.labelOffY,
       };
 
       return { id: n.id, data: { ...n, isActive }, style: { ...style, x: pos.x, y: pos.y } };
@@ -321,10 +331,10 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
           stroke: isActivePath ? 'rgba(129, 140, 248, 0.5)' : 'rgba(255,255,255,0.06)',
           lineWidth: isActivePath ? 1.2 : 0.5,
           endArrow: true,
-          endArrowSize: isCompact ? 3 : 5,
-          labelText: isCompact ? '' : (e.label || ''),
+          endArrowSize: cLayout.arrowSz,
+          labelText: cLayout.edgeLabel ? (e.label || '') : '',
           labelFill: '#71717a',
-          labelFontSize: 6,
+          labelFontSize: cLayout.edgeLabelFs,
           labelFontFamily: 'JetBrains Mono, monospace',
           labelBackground: true,
           labelBackgroundFill: '#18181b',
@@ -348,13 +358,24 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
     graph.render();
     graphRef.current = graph;
 
+    let prevTier: string | null = null;
+    try { prevTier = getScaledLayout(containerRef.current!.clientWidth).tier; } catch {}
+
     const handleResize = () => {
-      if (containerRef.current && graphRef.current) {
-        const w = containerRef.current.clientWidth;
-        const { totalHeight: th } = getScaledLayout(w);
-        graphRef.current.setSize(w, Math.max(th, 300));
-        graphRef.current.fitView();
+      if (!containerRef.current || !graphRef.current) return;
+      const w = containerRef.current.clientWidth;
+      const layout = getScaledLayout(w);
+      // Cross-tier resize: destroy and rebuild to apply new layout constants
+      if (prevTier !== null && layout.tier !== prevTier) {
+        graphRef.current.destroy();
+        graphRef.current = null;
+        return;
       }
+      // Same tier: safe to resize
+      const { totalHeight: th } = layout;
+      graphRef.current.setSize(w, Math.max(th, 300));
+      graphRef.current.fitView();
+      prevTier = layout.tier;
     };
 
     const observer = new ResizeObserver(handleResize);
