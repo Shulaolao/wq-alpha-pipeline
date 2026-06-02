@@ -1242,11 +1242,43 @@ def _generate_direct_rank_candidates(ortho: dict, active_exprs: list) -> list:
 
         # ── Pattern 4: cross-domain (fund + native-ts pv1, proven working) ──
         ("debt", "returns", "subtract", 2.0, "debt_ret_sub2", []),
-        ("revenue", "returns", "subtract", 1.0, "rev_ret_sub", [0.5, 0.7, 0.9]),
-        ("cap", "returns", "add", 1.0, "cap_ret_add", [0.5, 0.7, 0.9]),
-        ("enterprise_value", "returns", "subtract", 1.0, "ev_ret_sub", [0.5, 0.7, 0.9]),
-        ("equity", "returns", "subtract", 1.0, "eq_ret_sub", [0.5, 0.7, 0.9]),
-        ("operating_income", "returns", "subtract", 1.0, "oi_ret_sub", [0.5, 0.7, 0.9]),
+        ("revenue", "returns", "subtract", 1.0, "rev_ret_sub", [0.3, 0.5, 0.7, 0.9]),
+        ("cap", "returns", "add", 1.0, "cap_ret_add", [0.3, 0.5, 0.7, 0.9]),
+        ("enterprise_value", "returns", "subtract", 1.0, "ev_ret_sub", [0.3, 0.5, 0.7, 0.9]),
+        ("equity", "returns", "subtract", 1.0, "eq_ret_sub", [0.3, 0.5, 0.7, 0.9]),
+        ("operating_income", "returns", "subtract", 1.0, "oi_ret_sub", [0.3, 0.5, 0.7, 0.9]),
+
+        # ── Pattern 5: fund + ts_corr(close, volume, N) — cross-correlation signal ──
+        ("debt", "ts_corr(close,volume,10)", "add", 1.0, "debt_cv10", [0.3, 0.5]),
+        ("revenue", "ts_corr(close,volume,10)", "add", 1.0, "rev_cv10", [0.3, 0.5]),
+        ("enterprise_value", "ts_corr(close,volume,10)", "add", 1.0, "ev_cv10", [0.3, 0.5]),
+        ("operating_income", "ts_corr(close,volume,10)", "add", 1.0, "oi_cv10", [0.3, 0.5]),
+
+        # ── Pattern 6: fund + ts_zscore(pv1) — zscore momentum ──
+        ("debt", "ts_zscore(close,20)", "add", 1.0, "debt_zs20", [0.3, 0.5, 0.7]),
+        ("revenue", "ts_zscore(close,20)", "add", 1.0, "rev_zs20", [0.3, 0.5, 0.7]),
+        ("enterprise_value", "ts_zscore(close,20)", "add", 1.0, "ev_zs20", [0.3, 0.5, 0.7]),
+        ("equity", "ts_zscore(close,20)", "add", 1.0, "eq_zs20", [0.3, 0.5, 0.7]),
+        ("operating_income", "ts_zscore(close,20)", "add", 1.0, "oi_zs20", [0.3, 0.5, 0.7]),
+
+        # ── Pattern 7: fund + ts_rank(pv1, N) — rank momentum ──
+        ("debt", "ts_rank(close,20)", "subtract", 1.0, "debt_rcl20", [0.3, 0.5]),
+        ("revenue", "ts_rank(close,20)", "subtract", 1.0, "rev_rcl20", [0.3, 0.5]),
+        ("enterprise_value", "ts_rank(close,20)", "subtract", 1.0, "ev_rcl20", [0.3, 0.5]),
+        ("operating_income", "ts_rank(close,20)", "subtract", 1.0, "oi_rcl20", [0.3, 0.5]),
+
+        # ── Pattern 8: ts_mean(returns, 20) — longer momentum window ──
+        ("debt", "ts_mean(returns,20)", "subtract", 1.0, "debt_mret20", [0.3, 0.5, 0.7]),
+        ("revenue", "ts_mean(returns,20)", "subtract", 1.0, "rev_mret20", [0.3, 0.5, 0.7]),
+        ("enterprise_value", "ts_mean(returns,20)", "subtract", 1.0, "ev_mret20", [0.3, 0.5, 0.7]),
+        ("operating_income", "ts_mean(returns,20)", "subtract", 1.0, "oi_mret20", [0.3, 0.5, 0.7]),
+        ("equity", "ts_mean(returns,20)", "subtract", 1.0, "eq_mret20", [0.3, 0.5, 0.7]),
+
+        # ── Pattern 9: ts_mean(volume, 20) — volume momentum ──
+        ("debt", "ts_mean(volume,20)", "subtract", 1.0, "debt_mvol20", [0.3, 0.5, 0.7]),
+        ("revenue", "ts_mean(volume,20)", "subtract", 1.0, "rev_mvol20", [0.3, 0.5, 0.7]),
+        ("enterprise_value", "ts_mean(volume,20)", "subtract", 1.0, "ev_mvol20", [0.3, 0.5, 0.7]),
+        ("operating_income", "ts_mean(volume,20)", "subtract", 1.0, "oi_mvol20", [0.3, 0.5, 0.7]),
     ]
 
     seen = set()
@@ -1690,20 +1722,21 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         all_candidates.extend(ratio_lag)
 
     # ── Advanced skeleton generators (v3.19) ──
-    # cross_gate, sign_switch, vol_adj, deep_cascade — each uses proven fields
-    # and at least one ts_* operator (S≠None guaranteed).
-    for gen_fn, skel_type, label in [
-        (_generate_cross_gate_candidates, SKELETON_CROSS_GATE, "CROSS_GATE"),
-        (_generate_sign_switch_candidates, SKELETON_SIGN_SWITCH, "SIGN_SWITCH"),
-        (_generate_vol_adj_candidates, SKELETON_VOL_ADJ, "VOL_ADJ"),
-        (_generate_deep_cascade_candidates, SKELETON_DEEP_CASCADE, "DEEP_CASCADE"),
-    ]:
-        advanced = gen_fn(ortho, active_exprs)
-        if advanced:
-            log(f"  🆕 Adding {len(advanced)} {label} candidates")
-            for c in advanced:
-                c["skeleton"] = skel_type
-            all_candidates.extend(advanced)
+    # cross_gate, sign_switch, vol_adj, deep_cascade — disabled pending field validation
+    # These advanced generators produce complex expressions that may fail coverage
+    # with the current 17-field pool. Re-enable when more fundamental fields are verified.
+    # for gen_fn, skel_type, label in [
+    #     (_generate_cross_gate_candidates, SKELETON_CROSS_GATE, "CROSS_GATE"),
+    #     (_generate_sign_switch_candidates, SKELETON_SIGN_SWITCH, "SIGN_SWITCH"),
+    #     (_generate_vol_adj_candidates, SKELETON_VOL_ADJ, "VOL_ADJ"),
+    #     (_generate_deep_cascade_candidates, SKELETON_DEEP_CASCADE, "DEEP_CASCADE"),
+    # ]:
+    #     advanced = gen_fn(ortho, active_exprs)
+    #     if advanced:
+    #         log(f"  🆕 Adding {len(advanced)} {label} candidates")
+    #         for c in advanced:
+    #             c["skeleton"] = skel_type
+    #         all_candidates.extend(advanced)
 
     if not all_candidates:
         log("  ⚠️ No candidates generated!", "error")

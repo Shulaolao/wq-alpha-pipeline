@@ -93,44 +93,48 @@ export default function AlphaCompleteList({ alphas, total }: Props) {
       </h2>
 
       {/* Filters */}
-      <div className="flex flex-wrap gap-2 mb-3">
+      <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-3">
+        {/* Search: full width on mobile, flexible on sm+ */}
         <input
           type="text"
-          placeholder="Search name/expr..."
+          placeholder="Search alpha name..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          className="flex-1 min-w-[160px] bg-dark-800/60 border border-white/[0.06] rounded-lg px-3 py-1.5
+          className="flex-1 min-w-[0] bg-dark-800/60 border border-white/[0.06] rounded-lg px-3 py-1.5
                      text-xs text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-500/30
                      transition-colors"
         />
-        <select
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
-          className="bg-dark-800/60 border border-white/[0.06] rounded-lg px-2.5 py-1.5
-                     text-[10px] text-gray-400 outline-none focus:border-indigo-500/30"
-        >
-          {statuses.map((s) => (
-            <option key={s} value={s}>{s === 'all' ? 'All Status' : STATUS_LABELS[s] || s}</option>
-          ))}
-        </select>
-        <input
-          type="number"
-          step="0.1"
-          placeholder="Min Sharpe"
-          value={minSharpe}
-          onChange={(e) => setMinSharpe(e.target.value)}
-          className="w-24 bg-dark-800/60 border border-white/[0.06] rounded-lg px-2.5 py-1.5
-                     text-[10px] text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-500/30"
-        />
-        <input
-          type="number"
-          step="0.1"
-          placeholder="Min SC Value"
-          value={minScValue}
-          onChange={(e) => setMinScValue(e.target.value)}
-          className="w-24 bg-dark-800/60 border border-white/[0.06] rounded-lg px-2.5 py-1.5
-                     text-[10px] text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-500/30"
-        />
+        {/* Filters: stack on mobile, row on sm+ */}
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="bg-dark-800/60 border border-white/[0.06] rounded-lg px-2.5 py-1.5
+                       text-[10px] text-gray-400 outline-none focus:border-indigo-500/30"
+          >
+            {statuses.map((s) => (
+              <option key={s} value={s}>{s === 'all' ? 'All Status' : STATUS_LABELS[s] || s}</option>
+            ))}
+          </select>
+          <input
+            type="number"
+            step="0.1"
+            placeholder="Min Sharpe"
+            value={minSharpe}
+            onChange={(e) => setMinSharpe(e.target.value)}
+            className="w-20 sm:w-24 bg-dark-800/60 border border-white/[0.06] rounded-lg px-2.5 py-1.5
+                       text-[10px] text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-500/30"
+          />
+          <input
+            type="number"
+            step="0.1"
+            placeholder="Min SC Value"
+            value={minScValue}
+            onChange={(e) => setMinScValue(e.target.value)}
+            className="w-20 sm:w-24 bg-dark-800/60 border border-white/[0.06] rounded-lg px-2.5 py-1.5
+                       text-[10px] text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-500/30"
+          />
+        </div>
       </div>
 
       {/* Count badge */}
@@ -139,7 +143,7 @@ export default function AlphaCompleteList({ alphas, total }: Props) {
       </div>
 
       {/* Column headers */}
-      <div className="grid grid-cols-[1fr_2fr_64px_64px_72px_100px] gap-2 text-[9px] text-gray-600 uppercase tracking-wider px-2 pb-1.5 border-b border-white/[0.04]">
+      <div className="hidden md:grid md:grid-cols-[1fr_2fr_64px_64px_72px_100px] gap-2 text-[9px] text-gray-600 uppercase tracking-wider px-2 pb-1.5 border-b border-white/[0.04]">
         <button onClick={() => toggleSort('name')} className="text-left hover:text-gray-400 transition-colors">
           Name {sortBy === 'name' && (sortDir === 'asc' ? '↑' : '↓')}
         </button>
@@ -156,6 +160,17 @@ export default function AlphaCompleteList({ alphas, total }: Props) {
         </button>
       </div>
 
+      {/* Mobile/Tablet Column Headers */}
+      <div className="hidden sm:grid sm:grid-cols-[1fr_64px_100px] gap-2 text-[9px] text-gray-600 uppercase tracking-wider px-2 pb-1.5 border-b border-white/[0.04]">
+        <button onClick={() => toggleSort('name')} className="text-left hover:text-gray-400 transition-colors">
+          Name {sortBy === 'name' && (sortDir === 'asc' ? '↑' : '↓')}
+        </button>
+        <div className="text-right">SC Value</div>
+        <button onClick={() => toggleSort('status')} className="text-right hover:text-gray-400 transition-colors">
+          Status
+        </button>
+      </div>
+
       {/* Rows */}
       <div className="max-h-[420px] overflow-y-auto scrollbar-thin">
         {filtered.length === 0 ? (
@@ -165,35 +180,65 @@ export default function AlphaCompleteList({ alphas, total }: Props) {
             <div key={a.name}>
               <button
                 onClick={() => setExpandedAlpha(expandedAlpha === a.name ? null : a.name)}
-                className="w-full grid grid-cols-[1fr_2fr_64px_64px_72px_100px] gap-2 px-2 py-2
-                           text-xs border-b border-white/[0.02] hover:bg-white/[0.02] transition-colors text-left"
+                className="w-full text-left"
               >
-                <span className="text-gray-200 font-mono text-[11px] truncate">{a.name}</span>
-                <span className="text-gray-400 font-mono text-[10px] truncate" title={a.expr || ''}>
-                  {a.expr || '-'}
-                </span>
-                <span className="text-right tabular-nums font-mono text-[11px]">
-                  {a.sharpe != null ? (
-                    <span className={a.sharpe >= 1.25 ? 'text-emerald-400' : a.sharpe >= 1.0 ? 'text-yellow-400' : 'text-gray-400'}>
-                      {a.sharpe.toFixed(3)}
-                    </span>
-                  ) : (
-                    <span className="text-gray-600">-</span>
-                  )}
-                </span>
-                <span className="text-right tabular-nums font-mono text-[11px]">
-                  {a.sc_value != null ? (
-                    <span className={a.sc_value >= 5 ? 'text-emerald-400' : a.sc_value >= 3 ? 'text-yellow-400' : a.sc_value >= 1 ? 'text-gray-400' : 'text-rose-400'}>
-                      {a.sc_value.toFixed(2)}
-                    </span>
-                  ) : (
-                    <span className="text-gray-600">-</span>
-                  )}
-                </span>
-                <span className="text-center text-gray-500 text-[10px]">{a.total_attempts}</span>
-                <span className={`text-right text-[10px] font-medium ${STATUS_COLORS[a.status] || 'text-gray-400'}`}>
-                  {STATUS_LABELS[a.status] || a.status}
-                </span>
+                {/* Desktop: 6-column layout */}
+                <div className="hidden md:grid md:grid-cols-[1fr_2fr_64px_64px_72px_100px] gap-2 px-2 py-2
+                               text-xs border-b border-white/[0.02] hover:bg-white/[0.02] transition-colors">
+                  <span className="text-gray-200 font-mono text-[11px] truncate">{a.name}</span>
+                  <span className="text-gray-400 font-mono text-[10px] truncate" title={a.expr || ''}>
+                    {a.expr || '-'}
+                  </span>
+                  <span className="text-right tabular-nums font-mono text-[11px]">
+                    {a.sharpe != null ? (
+                      <span className={a.sharpe >= 1.25 ? 'text-emerald-400' : a.sharpe >= 1.0 ? 'text-yellow-400' : 'text-gray-400'}>
+                        {a.sharpe.toFixed(3)}
+                      </span>
+                    ) : (
+                      <span className="text-gray-600">-</span>
+                    )}
+                  </span>
+                  <span className="text-right tabular-nums font-mono text-[11px]">
+                    {a.sc_value != null ? (
+                      <span className={a.sc_value >= 5 ? 'text-emerald-400' : a.sc_value >= 3 ? 'text-yellow-400' : a.sc_value >= 1 ? 'text-gray-400' : 'text-rose-400'}>
+                        {a.sc_value.toFixed(2)}
+                      </span>
+                    ) : (
+                      <span className="text-gray-600">-</span>
+                    )}
+                  </span>
+                  <span className="text-center text-gray-500 text-[10px]">{a.total_attempts}</span>
+                  <span className={`text-right text-[10px] font-medium ${STATUS_COLORS[a.status] || 'text-gray-400'}`}>
+                    {STATUS_LABELS[a.status] || a.status}
+                  </span>
+                </div>
+
+                {/* Tablet: 3-column layout (name, SC, status) */}
+                <div className="sm:hidden md:hidden grid sm:grid-cols-[1fr_64px_100px] gap-2 px-2 py-2
+                               text-xs border-b border-white/[0.02] hover:bg-white/[0.02] transition-colors">
+                  <span className="text-gray-200 font-mono text-[11px] truncate">{a.name}</span>
+                  <span className="text-right tabular-nums font-mono text-[11px]">
+                    {a.sc_value != null ? (
+                      <span className={a.sc_value >= 5 ? 'text-emerald-400' : a.sc_value >= 3 ? 'text-yellow-400' : a.sc_value >= 1 ? 'text-gray-400' : 'text-rose-400'}>
+                        {a.sc_value.toFixed(2)}
+                      </span>
+                    ) : (
+                      <span className="text-gray-600">-</span>
+                    )}
+                  </span>
+                  <span className={`text-right text-[10px] font-medium ${STATUS_COLORS[a.status] || 'text-gray-400'}`}>
+                    {STATUS_LABELS[a.status] || a.status}
+                  </span>
+                </div>
+
+                {/* Mobile: single line (name + status) */}
+                <div className="grid grid-cols-[1fr_100px] gap-2 px-2 py-2
+                               text-xs border-b border-white/[0.02] hover:bg-white/[0.02] transition-colors sm:hidden">
+                  <span className="text-gray-200 font-mono text-[11px] truncate">{a.name}</span>
+                  <span className={`text-right text-[10px] font-medium ${STATUS_COLORS[a.status] || 'text-gray-400'}`}>
+                    {STATUS_LABELS[a.status] || a.status}
+                  </span>
+                </div>
               </button>
 
               {/* Expanded state chain */}

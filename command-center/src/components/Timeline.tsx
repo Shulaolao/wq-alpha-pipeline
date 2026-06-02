@@ -57,38 +57,54 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
   const flatEvents = useMemo(() => {
     if (!events?.length) return [];
     const first = events[0];
-    if ('timestamp' in first && first.timestamp) {
-      // Legacy flat format
+    
+    // SQLite grouped format: {name, expr, alpha_id, events: [...]}
+    if ('events' in first && Array.isArray(first.events)) {
+      const flat: any[] = [];
+      for (const alpha of events) {
+        const alphaName = alpha.name || '';
+        const alphaExpr = alpha.expr || '';
+        for (const subEvt of (alpha.events || [])) {
+          flat.push({
+            timestamp: subEvt.created_at || '',
+            event: subEvt.event_type || '',
+            alphaName,
+            alphaExpr,
+            sharpe: subEvt.sharpe,
+            fitness: subEvt.fitness,
+            scValue: subEvt.sc_value,
+            scResult: subEvt.sc_result,
+          });
+        }
+      }
+      return flat;
+    }
+    
+    // Legacy flat format from /api/history: {created_at, event_type, name, ...}
+    if ('created_at' in first && 'event_type' in first) {
       return events.map((evt: any) => ({
-        timestamp: evt.timestamp,
-        event: evt.event,
-        alphaName: evt.alpha_name || '',
-        alphaExpr: evt.alpha_expr || '',
-        sharpe: evt.details?.sharpe,
-        fitness: evt.details?.fitness,
-        scValue: evt.details?.sc_value,
-        scResult: evt.details?.sc_result,
+        timestamp: evt.created_at,
+        event: evt.event_type,
+        alphaName: evt.name || '',
+        alphaExpr: '',
+        sharpe: evt.sharpe,
+        fitness: evt.fitness,
+        scValue: evt.sc_value,
+        scResult: evt.sc_result,
       }));
     }
-    // SQLite grouped format: {name, expr, alpha_id, events: [...]}
-    const flat: any[] = [];
-    for (const alpha of events) {
-      const alphaName = alpha.name || '';
-      const alphaExpr = alpha.expr || '';
-      for (const subEvt of (alpha.events || [])) {
-        flat.push({
-          timestamp: subEvt.created_at || '',
-          event: subEvt.event_type || '',
-          alphaName,
-          alphaExpr,
-          sharpe: subEvt.sharpe,
-          fitness: subEvt.fitness,
-          scValue: subEvt.sc_value,
-          scResult: subEvt.sc_result,
-        });
-      }
-    }
-    return flat;
+    
+    // Fallback: legacy flat format with timestamp/event
+    return events.map((evt: any) => ({
+      timestamp: evt.timestamp,
+      event: evt.event,
+      alphaName: evt.alpha_name || '',
+      alphaExpr: '',
+      sharpe: evt.details?.sharpe,
+      fitness: evt.details?.fitness,
+      scValue: evt.details?.sc_value,
+      scResult: evt.details?.sc_result,
+    }));
   }, [events]);
 
   // Sort newest first, limit to 50
