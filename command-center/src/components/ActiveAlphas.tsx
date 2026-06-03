@@ -41,30 +41,33 @@ export default function ActiveAlphas({ alphas, total, target }: ActiveAlphasProp
           <span className="ml-1 text-gray-700 font-normal normal-case">/ {target}</span>
         )}
       </h2>
-      <div className="overflow-x-auto">
-        <table className="w-full text-[11px]">
+      <div className="overflow-x-auto max-w-full">
+        <table className="w-full text-[11px]" style={{ tableLayout: 'fixed' }}>
           <thead>
             <tr className="text-gray-600 border-b border-white/[0.06]">
-              <th className="text-left py-2 pr-3 font-medium">ID</th>
-              <th className="text-left py-2 pr-3 font-medium">Expression</th>
-              <th className="text-right py-2 w-14 font-medium">S</th>
-              <th className="text-right py-2 w-14 font-medium">F</th>
+              <th className="text-left py-2 font-medium" style={{ width: '2.5rem' }}>ID</th>
+              <th className="text-left py-2 font-medium">Expression</th>
+              <th className="text-right py-2 font-medium" style={{ width: '3.5rem' }}>S</th>
+              <th className="text-right py-2 font-medium" style={{ width: '3.5rem' }}>F</th>
             </tr>
           </thead>
           <tbody>
             {alphas.map((alpha) => (
               <tr key={alpha.id} className="border-b border-white/[0.02] hover:bg-white/[0.02] transition-colors">
-                <td className="py-2 pr-3 font-mono text-indigo-300">{alpha.id}</td>
-                <td className="py-2 pr-3">
+                <td className="py-2 font-mono text-indigo-300 align-top whitespace-nowrap" style={{ width: '2.5rem' }}>
+                  {alpha.id}
+                </td>
+                <td className="py-2">
                   <span
                     className="font-mono text-xs leading-relaxed"
+                    style={{ overflowWrap: 'break-word', wordBreak: 'break-all' }}
                     dangerouslySetInnerHTML={{ __html: highlightExpr(alpha.expr) }}
                   />
                 </td>
-                <td className="py-2 text-right font-mono tabular-nums">
+                <td className="py-2 text-right font-mono tabular-nums" style={{ width: '3.5rem' }}>
                   {alpha.sharpe != null ? alpha.sharpe.toFixed(2) : '—'}
                 </td>
-                <td className="py-2 text-right font-mono tabular-nums">
+                <td className="py-2 text-right font-mono tabular-nums" style={{ width: '3.5rem' }}>
                   {alpha.fitness != null ? alpha.fitness.toFixed(2) : '—'}
                 </td>
               </tr>
