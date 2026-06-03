@@ -94,12 +94,14 @@ ALL_WQ_FIELDS = [
 ]
 
 # Operators to recognize in expressions (for orthogonality analysis of structure)
+# WARNING: ONLY include operators that are PROVEN to work on WQ platform.
+# sign(), abs(), max(), min(), clip(), zscore(), winsorize(), truncate() are NOT verified WQ operators.
 ALL_WQ_OPERATORS = [
     "rank", "ts_mean", "ts_sum", "ts_std", "ts_corr", "ts_rank",
     "ts_min", "ts_max", "ts_argmin", "ts_argmax", "ts_zscore",
     "ts_delta", "ts_trend", "ts_percentile", "scale", "group_rank",
-    "log", "sign", "abs", "max", "min", "clip", "ind_neutral",
-    "sector_neutral", "zscore", "winsorize", "truncate",
+    "log", "ind_neutral",
+    "sector_neutral",
 ]
 
 FIELD_PATTERN = re.compile(r'\b(' + '|'.join(re.escape(f) for f in ALL_WQ_FIELDS) + r')\b')
@@ -881,10 +883,6 @@ def _build_cross_domain_ratio_pool(ortho: dict, skip_zero_occupancy: bool = Fals
                 if pv1_field == "close":  # close used too broadly
                     continue
                 # Direction 1: temporal(PV1) / FUND
-                cross_expr_1 = f"rank({temporal_op}({pv1_field},{period})/{'/' if True else ''}"
-                # Actually build the full expression correctly
-                cross_expr_1 = f"rank({temporal_op}({pv1_field},{period})"
-                
                 for fund_field in fund_fields:
                     if skip_zero_occupancy and fund_field in zero_usage:
                         continue
@@ -1055,6 +1053,51 @@ def _generate_temporal_wrap_candidates(ortho: dict, active_exprs: list) -> list:
                         "expr": expr,
                         "orthogonality_score": score,
                         "skeleton": SKELETON_SIGN_SWITCH,
+                        "weight": 1.0,
+                    })
+    
+    candidates.sort(key=lambda x: -x["orthogonality_score"])
+    return candidates
+
+
+def _generate_cross_gate_candidates(ortho: dict, active_exprs: list) -> list:
+    """Pattern A: rank(Price_Field) * sign(ts_delta(Fund_Field, N)) — 跨域条件门控。
+    
+    严格遵循 prompt 要求：rank(pv1) 直接作为截面算子，与 sign(ts_delta(fund, N)) 相乘。
+    这是最直接的跨域交互因子形式，同时满足 S≠None 要求（ts_delta 提供时序性）。
+    """
+    candidates = []
+    seen = set()
+    
+    for pv1_field in list(PV1_FIELDS):
+        if pv1_field in ("close",):  # close used too broadly
+            continue
+        for fund_field in list(FUND_FIELDS):
+            if fund_field in ("ebitda", "cash", "sales"):
+                continue
+            for n in [3, 5, 7, 10]:
+                # rank(PV1) * sign(ts_delta(FUND, N)) — 核心 pattern
+                expr = f"rank({pv1_field}) * sign(ts_delta({fund_field}, {n}))"
+                if expr not in seen:
+                    seen.add(expr)
+                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                    candidates.append({
+                        "name": f"CG_{pv1_field}_{fund_field}_p{n}"[:40],
+                        "expr": expr,
+                        "orthogonality_score": score,
+                        "skeleton": SKELETON_CROSS_GATE,
+                        "weight": 1.0,
+                    })
+                # 反转方向：rank(FUND) * sign(ts_delta(PV1, N))
+                expr2 = f"rank({fund_field}) * sign(ts_delta({pv1_field}, {n}))"
+                if expr2 not in seen:
+                    seen.add(expr2)
+                    score = score_candidate_orthogonality(expr2, ortho, active_exprs)
+                    candidates.append({
+                        "name": f"CG_{fund_field}_rev_{pv1_field}_p{n}"[:40],
+                        "expr": expr2,
+                        "orthogonality_score": score,
+                        "skeleton": SKELETON_CROSS_GATE,
                         "weight": 1.0,
                     })
     
@@ -1955,25 +1998,17 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         log(f"  ⏰ Adding {len(ratio_lag)} RATIO_LAG candidates")
         all_candidates.extend(ratio_lag)
 
-    # ── Advanced skeleton generators (v3.19) ──
-    # cross_gate, sign_switch, vol_adj, deep_cascade — disabled pending field validation
-    # These advanced generators produce complex expressions that may fail coverage
-    # with the current 17-field pool. Re-enable when more fundamental fields are verified.
-    # for gen_fn, skel_type, label in [
-    #     (_generate_cross_gate_candidates, SKELETON_CROSS_GATE, "CROSS_GATE"),
-    #     (_generate_sign_switch_candidates, SKELETON_SIGN_SWITCH, "SIGN_SWITCH"),
-    #     (_generate_vol_adj_candidates, SKELETON_VOL_ADJ, "VOL_ADJ"),
-    #     (_generate_deep_cascade_candidates, SKELETON_DEEP_CASCADE, "DEEP_CASCADE"),
-    # ]:
-    #     advanced = gen_fn(ortho, active_exprs)
-    #     if advanced:
-    #         log(f"  🆕 Adding {len(advanced)} {label} candidates")
-    #         for c in advanced:
-    #             c["skeleton"] = skel_type
-    #         all_candidates.extend(advanced)
-
-    # ── Task 1: Cross-domain conditional gating generators ──
-    # Build cross-domain ratio pool: temporal(PV1)/FUND or FUND/temporal(PV1)
+    # ── Advanced skeleton generators (v3.19 + v4 Task 1) ──
+    # cross_gate, sign_switch, vol_adj, deep_cascade — re-enabled in v4
+    
+    # v4 Task 1: Cross-domain conditional gating — rank(PV1) * sign(ts_delta(FUND, N))
+    # This is the direct implementation of the prompt's core pattern.
+    cross_gate = _generate_cross_gate_candidates(ortho, active_exprs)
+    if cross_gate:
+        log(f"  🌐 Adding {len(cross_gate)} cross-gate candidates (rank(PV1)*sign(ts_delta(FUND,N)))")
+        all_candidates.extend(cross_gate)
+    
+    # v4 Task 1: Cross-domain ratio pool → MULT skeleton
     cross_pool = _build_cross_domain_ratio_pool(ortho, skip_zero_occupancy=(stuck_batches >= 2))
     if cross_pool:
         log(f"  🌐 Cross-domain pool: {len(cross_pool)} ratio pairs (temporal gating enabled)")
@@ -1981,7 +2016,7 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         log(f"  🌐 Adding {len(cross_candidates)} cross-domain MULT candidates")
         all_candidates.extend(cross_candidates)
     
-    # Temporal wrap candidates: proven fund ratios + high-order temporal operators
+    # v4 Task 1: Temporal wrap candidates — fund ratios + ts_*/sign wrappers
     tw_candidates = _generate_temporal_wrap_candidates(ortho, active_exprs)
     if tw_candidates:
         log(f"  ⏳ Adding {len(tw_candidates)} temporal-wrap candidates (ts_delta/zscore/sign)")
@@ -2813,7 +2848,7 @@ class DynamicSkeletonBuilder:
         2. 在外层包裹 ts_zscore — 将 Level 信号转为 Extreme 信号
         3. 在外层包裹 ts_rank — 将 Level 信号转为 Rank 信号
         4. 替换最外层的 ts_mean 为 ts_delta — 破坏平滑性
-        5. 在最外层加 ind_neutralize — 剥离行业暴露
+        5. 在最外层加 ind_neutral — 剥离行业暴露
         
         Returns: list of mutated candidate dicts
         """
@@ -2868,8 +2903,8 @@ class DynamicSkeletonBuilder:
                     "skeleton": SKELETON_RESIDUAL,
                 })
         
-        # Mutation 5: ind_neutralize(expr, IndClass.subindustry)
-        mut = f"ind_neutralize({expr}, IndClass.subindustry)"
+        # Mutation 5: ind_neutral(expr, IndClass.subindustry)
+        mut = f"ind_neutral({expr}, IndClass.subindustry)"
         if mut not in seen:
             seen.add(mut)
             mutations.append({
