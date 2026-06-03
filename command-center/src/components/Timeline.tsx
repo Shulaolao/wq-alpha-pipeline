@@ -53,12 +53,10 @@ function fmt(s: number | null | undefined, decimals = 2): string {
 }
 
 export default function Timeline({ events, total, currentCandidate }: TimelineProps) {
-  // Normalize: flatten SQLite nested format into flat event list with alpha metadata
   const flatEvents = useMemo(() => {
     if (!events?.length) return [];
     const first = events[0];
     
-    // SQLite grouped format: {name, expr, alpha_id, events: [...]}
     if ('events' in first && Array.isArray(first.events)) {
       const flat: any[] = [];
       for (const alpha of events) {
@@ -80,7 +78,6 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
       return flat;
     }
     
-    // Legacy flat format from /api/history: {created_at, event_type, name, ...}
     if ('created_at' in first && 'event_type' in first) {
       return events.map((evt: any) => ({
         timestamp: evt.created_at,
@@ -94,7 +91,6 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
       }));
     }
     
-    // Fallback: legacy flat format with timestamp/event
     return events.map((evt: any) => ({
       timestamp: evt.timestamp,
       event: evt.event,
@@ -107,7 +103,6 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
     }));
   }, [events]);
 
-  // Sort newest first, limit to 50
   const sorted = useMemo(() =>
     [...flatEvents]
       .sort((a: any, b: any) => {
@@ -134,7 +129,6 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
     <div className="card p-4">
       {header}
 
-      {/* Current Tuning Expression */}
       {hasCurrent && (
         <div className="mb-3 p-2.5 rounded-lg bg-indigo-500/8 border border-indigo-500/15">
           <div className="text-[10px] text-indigo-400 font-semibold uppercase tracking-wider mb-1">
@@ -159,7 +153,6 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
         </div>
       )}
 
-      {/* Event List */}
       <div className="space-y-0.5 text-xs max-h-56 overflow-y-auto">
         {sorted.length === 0 ? (
           <div className="text-gray-600 text-xs text-center py-6">No activity yet</div>

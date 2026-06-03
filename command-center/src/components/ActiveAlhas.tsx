@@ -2,7 +2,7 @@
 
 import type { ActiveAlpha } from '@/types/dashboard';
 
-interface ActiveAlphasProps {
+interface ActiveAlhasProps {
   alphas: ActiveAlpha[];
   total?: number;
   target?: number;
@@ -13,19 +13,23 @@ function highlightExpr(expr: string) {
   const fieldRx = /\b(revenue|enterprise_value|debt|equity|operating_income|ebitda|cap|cash|sales|close|volume|adv20|returns|vwap|open|high|low)\b/g;
   const kwRx = /\b(rank|ts_mean|ts_sum|ts_std|ts_corr|ts_rank|ts_min|ts_max|ts_delta|ts_zscore|log|sign|abs|scale|group_rank|zscore|max|min|clip)\b/g;
   let html = expr.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  html = html.replace(fieldRx, '<span class="sf">$1</span>');
-  html = html.replace(kwRx, '<span class="so">$1</span>');
-  html = html.replace(/[()*+\-]/g, '<span class="sp">$&</span>');
-  html = html.replace(/\b\d+\.?\d*\b/g, '<span class="sn">$&</span>');
+  html = html.replace(fieldRx, '<span class="af">$1</span>');
+  html = html.replace(kwRx, '<span class="ao">$1</span>');
+  html = html.replace(/[()*+\\-]/g, '<span class="ap">$&</span>');
+  html = html.replace(/\b\d+\.?\d*\b/g, '<span class="an">$&</span>');
   return html;
 }
 
-export default function ActiveAlphas({ alphas, total, target }: ActiveAlphasProps) {
+export default function ActiveAlhas({ alphas, total, target }: ActiveAlhasProps) {
   if (!alphas || alphas.length === 0) {
     return (
       <div className="card p-4">
         <h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500 mb-3">
-          Active Alphas
+          Active Alhas
+          <span className="ml-2 text-gray-600 font-normal normal-case">{total ?? 0}</span>
+          {target != null && (
+            <span className="ml-1 text-gray-700 font-normal normal-case">/ {target}</span>
+          )}
         </h2>
         <div className="text-gray-600 text-xs text-center py-6">No active alphas yet</div>
       </div>
@@ -35,7 +39,7 @@ export default function ActiveAlphas({ alphas, total, target }: ActiveAlphasProp
   return (
     <div className="card p-4">
       <h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500 mb-3">
-        Active Alphas
+        Active Alhas
         <span className="ml-2 text-gray-600 font-normal normal-case">{alphas.length}</span>
         {target != null && (
           <span className="ml-1 text-gray-700 font-normal normal-case">/ {target}</span>
@@ -75,10 +79,10 @@ export default function ActiveAlphas({ alphas, total, target }: ActiveAlphasProp
         </table>
       </div>
       <style jsx>{`
-        .sf { color: #818cf8; }
-        .so { color: #34d399; }
-        .sn { color: #fbbf24; }
-        .sp { color: #6b7280; }
+        .af { color: #818cf8; }
+        .ao { color: #34d399; }
+        .an { color: #fbbf24; }
+        .ap { color: #6b7280; }
       `}</style>
     </div>
   );
