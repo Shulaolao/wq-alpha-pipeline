@@ -262,34 +262,36 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
   const isStuckOrLoop = ['org_stuck', 'dec_stuck', 'act_stuck_inc', 'dec_stuck3', 'act_stuck_mode', 'act_loop'].some(id => activeIds.has(id));
 
   return (
-    <div ref={containerRef} className="card p-2 md:p-3 animate-[fade-in_0.3s_ease-out]">
+    <div ref={containerRef} className="card bg-zinc-900/50 border border-zinc-800/50 rounded-xl p-2 md:p-3">
       {/* Header */}
       <div
-        className="flex items-center justify-between cursor-pointer md:cursor-default select-none"
+        className="flex items-center justify-between select-none"
         onClick={() => { if (isMobile) setExpanded(!expanded); }}
       >
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-indigo-400 text-[10px] shrink-0">◈</span>
-          <h2 className="text-[10px] md:text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500 shrink-0">
+          <span className="text-indigo-400/80 text-[10px] shrink-0">◈</span>
+          <h2 className="text-[10px] md:text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-500 shrink-0">
             Pipeline
           </h2>
           {activeCount != null && (
-            <span className="text-gray-600 font-normal text-[9px] md:text-[10px] shrink-0">
+            <span className="text-zinc-600 font-normal text-[9px] md:text-[10px] tabular-nums shrink-0">
               {activeCount}/{target ?? 20}
             </span>
           )}
         </div>
         <div className="flex items-center gap-2 min-w-0 flex-1 justify-end">
-          <span className="text-[8px] md:text-[9px] text-indigo-300/70 truncate hidden sm:block">
+          <span className="text-[8px] md:text-[9px] text-indigo-300/60 truncate hidden sm:block">
             {getPhaseEmoji(phase)} {getPhaseName(phase)}
           </span>
           {batchIndex != null && (
-            <span className="bg-zinc-800/60 px-1.5 py-0.5 rounded text-[8px] md:text-[9px] text-gray-500 font-mono shrink-0">
+            <span className="bg-zinc-800/50 px-1.5 py-0.5 rounded text-[8px] md:text-[9px] text-zinc-500 font-mono shrink-0 border border-zinc-700/30">
               {batchIndex}/{batchTotal ?? '?'}
             </span>
           )}
-          <span className={`px-1.5 py-0.5 rounded text-[8px] md:text-[9px] font-mono shrink-0 ${
-            phase === 'done' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-indigo-500/10 text-indigo-400'
+          <span className={`px-1.5 py-0.5 rounded text-[8px] md:text-[9px] font-mono shrink-0 border ${
+            phase === 'done'
+              ? 'bg-emerald-500/10 text-emerald-400/80 border-emerald-500/20'
+              : 'bg-indigo-500/10 text-indigo-400/80 border-indigo-500/20'
           }`}>
             {phase}
           </span>
@@ -316,12 +318,26 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
       {expanded && (
         <>
           {/* Legend */}
-          <div className="hidden sm:flex items-center gap-3 mt-1 mb-1 text-[9px] text-gray-600">
-            <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-sm bg-zinc-800 border border-indigo-500" /> Phase</span>
-            <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-sm bg-zinc-800 border border-amber-500" /> Decision</span>
-            <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-sm bg-zinc-800 border border-emerald-500" /> Action</span>
-            <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-sm bg-indigo-900 border border-indigo-400" /> Active</span>
-            <span className="text-zinc-700 ml-auto hidden md:inline">矩形闭环 · 循环回流</span>
+          <div className="hidden sm:flex items-center gap-3 mt-1.5 mb-1.5 text-[8px] text-zinc-600">
+            <span className="flex items-center gap-1.5">
+              <svg width="6" height="6"><polygon
+                points="3,0.5 6,2 5,5 1,5 0,2" fill="transparent" stroke="#6366f1" strokeWidth="0.8" /></svg>
+              <span className="uppercase tracking-wider">Phase</span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <svg width="8" height="8"><polygon
+                points="4,0.5 7.5,4 4,7.5 0.5,4" fill="transparent" stroke="#f59e0b" strokeWidth="0.8" /></svg>
+              <span className="uppercase tracking-wider">Decision</span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <svg width="6" height="6"><circle cx="3" cy="3" r="2.5" fill="transparent" stroke="#34d399" strokeWidth="0.8" /></svg>
+              <span className="uppercase tracking-wider">Action</span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <svg width="6" height="6"><circle cx="3" cy="3" r="3" fill="none" stroke="#818cf8" strokeWidth="1" strokeDasharray="1.5,1" /></svg>
+              <span className="uppercase tracking-wider text-indigo-400/70">Active</span>
+            </span>
+            <span className="text-zinc-700 ml-auto">矩形闭环 · 循环回流</span>
           </div>
 
           {/* SVG */}
@@ -337,10 +353,10 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
                   <path d="M0,0 L2,0.75 L0,1.5Z" fill="rgba(255,255,255,0.08)" />
                 </marker>
                 <marker id="wfArrAct" markerWidth="2.5" markerHeight="2" refX="2" refY="1" orient="auto">
-                  <path d="M0,0 L2.5,1 L0,2Z" fill="rgba(129,140,248,0.5)" />
+                  <path d="M0,0 L2.5,1 L0,2Z" fill="rgba(129,140,248,0.6)" />
                 </marker>
                 <marker id="wfArrGreen" markerWidth="2.5" markerHeight="2" refX="2" refY="1" orient="auto">
-                  <path d="M0,0 L2.5,1 L0,2Z" fill="rgba(52,211,153,0.5)" />
+                  <path d="M0,0 L2.5,1 L0,2Z" fill="rgba(52,211,153,0.6)" />
                 </marker>
                 <marker id="wfArrAmber" markerWidth="2.5" markerHeight="2" refX="2" refY="1" orient="auto">
                   <path d="M0,0 L2.5,1 L0,2Z" fill="rgba(245,158,11,0.5)" />
@@ -349,13 +365,29 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
                   <feGaussianBlur stdDeviation="1.5" result="blur" />
                   <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
                 </filter>
+                <filter id="wfGlowStrong">
+                  <feGaussianBlur stdDeviation="3" result="blur" />
+                  <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+                </filter>
+                <linearGradient id="wfEdgeActive" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="#818cf8" stopOpacity="0.7" />
+                  <stop offset="100%" stopColor="#818cf8" stopOpacity="0.3" />
+                </linearGradient>
+                <linearGradient id="wfEdgeGreen" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="#34d399" stopOpacity="0.6" />
+                  <stop offset="100%" stopColor="#34d399" stopOpacity="0.2" />
+                </linearGradient>
+                <radialGradient id="wfNodeBgActive" cx="40%" cy="35%" r="60%">
+                  <stop offset="0%" stopColor="rgba(129,140,248,0.3)" />
+                  <stop offset="100%" stopColor="rgba(49,46,129,0.1)" />
+                </radialGradient>
               </defs>
 
               {/* Background: subtle rectangle outline */}
               <rect x={2} y={10} width={93} height={56} rx={2}
                 fill="none" stroke="rgba(255,255,255,0.02)" strokeWidth={0.3} strokeDasharray="2,3" />
 
-              {/* Edges */}
+              {/* Layer 0: dim edges (rendered first, behind everything) */}
               {EDGES.map(e => {
                 const sp = NODE_LAYOUT[e.source];
                 const tp = NODE_LAYOUT[e.target];
@@ -365,15 +397,59 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
                 const pathActive = sActive || tActive || (isStuckOrLoop && (e.target === 'act_loop' || e.source === 'act_loop'));
                 const isLoop = e.style === 'loop';
 
+                if (!pathActive) return null;
+
                 let markerId = 'url(#wfArr)';
                 if (pathActive && isLoop) markerId = 'url(#wfArrGreen)';
                 else if (pathActive) markerId = 'url(#wfArrAct)';
-                const edgeColor = isLoop ? 'rgba(52,211,153,0.35)' : pathActive ? 'rgba(129,140,248,0.4)' : 'rgba(255,255,255,0.05)';
-                const edgeWidth = isLoop ? 1.2 : pathActive ? 0.8 : 0.4;
 
                 let d = '';
                 if (isLoop) {
-                  // Loop-back path: from act_loop (bottom-left) back to org_ortho (top-left)
+                  const lx = VB_W * 0.05;
+                  d = `M${sp.x},${sp.y} L${lx},${sp.y} L${lx},${tp.y} L${tp.x - 2},${tp.y}`;
+                } else if (e.style === 'ortho' || (e.source === 'dec_stuck' && e.target === 'act_loop')) {
+                  const mx = (sp.x + tp.x) / 2;
+                  d = `M${sp.x},${sp.y} L${mx},${sp.y} L${mx},${tp.y} L${tp.x},${tp.y}`;
+                } else {
+                  d = `M${sp.x},${sp.y} L${tp.x},${tp.y}`;
+                }
+
+                const edgeColor = isLoop ? 'url(#wfEdgeGreen)' : 'url(#wfEdgeActive)';
+                const edgeWidth = isLoop ? 1.5 : pathActive ? 1.2 : 0.6;
+
+                return (
+                  <g key={`active-${e.source}→${e.target}`}>
+                    <path d={d} fill="none" stroke={edgeColor} strokeWidth={edgeWidth}
+                      strokeDasharray={isLoop ? '1.5,1.5' : 'none'}
+                      markerEnd={markerId} opacity={0.85} filter="url(#wfGlow)" />
+                    {e.label && (
+                      <text x={(sp.x + tp.x) / 2} y={(sp.y + tp.y) / 2 - 1.8}
+                        textAnchor="middle" dominantBaseline="central"
+                        fill="rgba(224,231,255,0.85)" fontSize={2.4}
+                        fontFamily="'JetBrains Mono',monospace"
+                        fontWeight={600}
+                        style={{ paintOrder: 'stroke', stroke: '#0f0f12', strokeWidth: 0.6, strokeLinecap: 'round', strokeLinejoin: 'round' }}>
+                        {e.label}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+
+              {/* Layer 1: dim edges (dim, thin, behind nodes) */}
+              {EDGES.map(e => {
+                const sp = NODE_LAYOUT[e.source];
+                const tp = NODE_LAYOUT[e.target];
+                if (!sp || !tp) return null;
+                const sActive = activeIds.has(e.source);
+                const tActive = activeIds.has(e.target);
+                const pathActive = sActive || tActive || (isStuckOrLoop && (e.target === 'act_loop' || e.source === 'act_loop'));
+                const isLoop = e.style === 'loop';
+
+                if (pathActive) return null;
+
+                let d = '';
+                if (isLoop) {
                   const lx = VB_W * 0.05;
                   d = `M${sp.x},${sp.y} L${lx},${sp.y} L${lx},${tp.y} L${tp.x - 2},${tp.y}`;
                 } else if (e.style === 'ortho' || (e.source === 'dec_stuck' && e.target === 'act_loop')) {
@@ -384,19 +460,10 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
                 }
 
                 return (
-                  <g key={`${e.source}→${e.target}`}>
-                    <path d={d} fill="none" stroke={edgeColor} strokeWidth={edgeWidth}
+                  <g key={`dim-${e.source}→${e.target}`}>
+                    <path d={d} fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth={0.4}
                       strokeDasharray={isLoop ? '1.5,1.5' : 'none'}
-                      markerEnd={markerId} opacity={pathActive ? 0.7 : 0.3} />
-                    {e.label && pathActive && (
-                      <text x={(sp.x + tp.x) / 2} y={(sp.y + tp.y) / 2 - 1.5}
-                        textAnchor="middle" dominantBaseline="central"
-                        fill="rgba(129,140,248,0.7)" fontSize={2.2}
-                        fontFamily="'JetBrains Mono',monospace"
-                        style={{ paintOrder: 'stroke', stroke: '#18181b', strokeWidth: 0.5, strokeLinecap: 'round', strokeLinejoin: 'round' }}>
-                        {e.label}
-                      </text>
-                    )}
+                      markerEnd="url(#wfArr)" opacity={0.5} />
                   </g>
                 );
               })}
@@ -408,73 +475,91 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
                 const isActive = activeIds.has(n.id);
                 const isEnd = n.type === 'end';
                 const color = NODE_COLORS[n.type] || '#6366f1';
-                const fill = isActive ? '#312e81' : n.type === 'end' ? '#065f46' : '#1e293b';
+                const fill = isActive ? 'url(#wfNodeBgActive)' : n.type === 'end' ? '#065f46' : '#1e293b';
                 const stroke = isActive ? '#818cf8' : color;
-                const labelColor = isActive ? '#c7d2fe' : n.type === 'end' ? '#a7f3d0' : n.type === 'phase' ? '#e2e8f0' : n.type === 'decision' ? '#fbbf24' : '#6ee7b7';
-                const dimColor = isActive ? 'rgba(199,210,254,0.6)' : 'rgba(113,113,122,0.4)';
+                const labelColor = isActive ? '#e0e7ff' : n.type === 'end' ? '#a7f3d0' : n.type === 'phase' ? '#e2e8f0' : n.type === 'decision' ? '#fbbf24' : '#6ee7b7';
+                const dimColor = isActive ? 'rgba(199,210,254,0.7)' : 'rgba(113,113,122,0.35)';
 
-                const r = isEnd ? 2.5 : isActive ? 3.5 : 3;
+                const r = isEnd ? 2.8 : isActive ? 3.8 : 3;
                 const isDecision = n.type === 'decision';
                 const isPhase = n.type === 'phase';
 
-                // Node shape: circle for action/phase, diamond for decision, special for end
+                // Active glow - dual layer
                 return (
                   <g key={n.id}>
-                    {/* Active glow */}
+                    {/* Active glow - dual layer */}
                     {isActive && (
-                      <circle cx={pos.x} cy={pos.y} r={r + 2} fill="none" stroke={`${stroke}30`}
-                        strokeWidth={0.6} opacity={0.4} filter="url(#wfGlow)" />
+                      <>
+                        <circle cx={pos.x} cy={pos.y} r={r + 3} fill="none" stroke={`${stroke}20`}
+                          strokeWidth={1.2} filter="url(#wfGlowStrong)" opacity={0.5} />
+                        <circle cx={pos.x} cy={pos.y} r={r + 1.8} fill="none" stroke={`${stroke}35`}
+                          strokeWidth={0.6} filter="url(#wfGlow)" opacity={0.7} />
+                      </>
                     )}
 
                     {/* Node body */}
                     {isDecision ? (
-                      // Diamond for decision nodes
                       <g>
                         <polygon
                           points={`${pos.x},${pos.y - r * 1.4} ${pos.x + r * 1.4},${pos.y} ${pos.x},${pos.y + r * 1.4} ${pos.x - r * 1.4},${pos.y}`}
-                          fill={fill} stroke={stroke} strokeWidth={isActive ? 1.5 : 0.7} opacity={isActive ? 1 : 0.6}
+                          fill={fill} stroke={stroke} strokeWidth={isActive ? 1.6 : 0.7}
+                          opacity={isActive ? 0.95 : 0.55}
+                          style={{
+                            filter: isActive ? 'url(#wfGlow)' : undefined,
+                          }}
                         />
                         <text x={pos.x} y={pos.y + 0.3} textAnchor="middle" dominantBaseline="central"
-                          fill={isActive ? '#fff' : dimColor} fontSize={2} fontFamily="monospace">?</text>
+                          fill={isActive ? '#fff' : dimColor} fontSize={2} fontFamily="monospace"
+                          fontWeight={600}>{isActive ? '?' : ''}</text>
                       </g>
                     ) : isEnd ? (
-                      // Star/medal for end node
-                      <circle cx={pos.x} cy={pos.y} r={r}
-                        fill={fill} stroke={stroke} strokeWidth={isActive ? 1.5 : 0.7} opacity={isActive ? 1 : 0.5} />
+                      <g>
+                        <circle cx={pos.x} cy={pos.y} r={r}
+                          fill={fill} stroke={stroke} strokeWidth={isActive ? 1.6 : 0.7}
+                          opacity={isActive ? 1 : 0.45}
+                          style={{ filter: isActive ? 'url(#wfGlow)' : undefined }}
+                        />
+                        <circle cx={pos.x} cy={pos.y} r={r * 0.5}
+                          fill={isActive ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.08)'}
+                        />
+                      </g>
                     ) : isPhase ? (
-                      // Hexagon for phase nodes
                       <g>
                         <polygon
-                          points={
-                            Array.from({ length: 6 }, (_, i) => {
-                              const a = (Math.PI / 3) * i - Math.PI / 6;
-                              return `${pos.x + r * Math.cos(a)},${pos.y + r * Math.sin(a)}`;
-                            }).join(' ')
-                          }
-                          fill={fill} stroke={stroke} strokeWidth={isActive ? 1.5 : 0.7} opacity={isActive ? 1 : 0.6}
+                          points={Array.from({ length: 6 }, (_, i) => {
+                            const a = (Math.PI / 3) * i - Math.PI / 6;
+                            return `${pos.x + r * Math.cos(a)},${pos.y + r * Math.sin(a)}`;
+                          }).join(' ')}
+                          fill={fill} stroke={stroke} strokeWidth={isActive ? 1.6 : 0.7}
+                          opacity={isActive ? 0.9 : 0.55}
+                          style={{ filter: isActive ? 'url(#wfGlow)' : undefined }}
                         />
                       </g>
                     ) : (
-                      // Circle for action nodes
-                      <circle cx={pos.x} cy={pos.y} r={r}
-                        fill={fill} stroke={stroke} strokeWidth={isActive ? 1.5 : 0.7} opacity={isActive ? 1 : 0.6} />
+                      <g>
+                        <circle cx={pos.x} cy={pos.y} r={r}
+                          fill={fill} stroke={stroke} strokeWidth={isActive ? 1.6 : 0.7}
+                          opacity={isActive ? 0.9 : 0.55}
+                          style={{ filter: isActive ? 'url(#wfGlow)' : undefined }}
+                        />
+                      </g>
                     )}
 
-                    {/* Label */}
-                    <text x={pos.x} y={pos.y - r - 1.5} textAnchor="middle" dominantBaseline="central"
+                    {/* Label - rendered on top of everything */}
+                    <text x={pos.x} y={pos.y - r - 1.8} textAnchor="middle" dominantBaseline="central"
                       fill={isActive ? labelColor : dimColor}
-                      fontSize={isActive ? 2.8 : 2.2}
+                      fontSize={isActive ? 3 : 2.2}
                       fontFamily="'JetBrains Mono',monospace"
-                      fontWeight={isActive ? 'bold' : 400}
-                      style={{ paintOrder: 'stroke', stroke: '#18181b', strokeWidth: 0.4, strokeLinecap: 'round', strokeLinejoin: 'round' }}>
+                      fontWeight={isActive ? 700 : 400}
+                      style={{ paintOrder: 'stroke', stroke: '#0f0f12', strokeWidth: 0.5, strokeLinecap: 'round', strokeLinejoin: 'round' }}>
                       {n.label}
                     </text>
 
                     {/* Subtitle */}
                     {n.subtitle && (
-                      <text x={pos.x} y={pos.y + r + 1.8} textAnchor="middle" dominantBaseline="central"
-                        fill={dimColor} fontSize={1.6} fontFamily="'JetBrains Mono',monospace"
-                        opacity={isActive ? 0.8 : 0.4}>
+                      <text x={pos.x} y={pos.y + r + 2.2} textAnchor="middle" dominantBaseline="central"
+                        fill={dimColor} fontSize={1.5} fontFamily="'JetBrains Mono',monospace"
+                        opacity={isActive ? 0.75 : 0.35}>
                         {n.subtitle}
                       </text>
                     )}
@@ -482,20 +567,23 @@ export default function WorkflowGraph({ phase, activeCount, target, batchIndex, 
                 );
               })}
 
-              {/* Loop-back arrow label */}
+              {/* Loop-back indicator */}
               <text x={7} y={40} textAnchor="middle" dominantBaseline="central"
-                fill="rgba(52,211,153,0.3)" fontSize={1.8} fontFamily="'JetBrains Mono',monospace"
-                transform="rotate(-90, 7, 40)">
+                fill="rgba(52,211,153,0.25)" fontSize={1.6} fontFamily="'JetBrains Mono',monospace"
+                transform="rotate(-90, 7, 40)"
+                style={{ letterSpacing: '0.05em' }}>
                 ← 循环回流
               </text>
 
-              {/* Corner labels */}
-              <text x={50} y={8} textAnchor="middle" dominantBaseline="central"
-                fill="rgba(255,255,255,0.04)" fontSize={1.6} fontFamily="monospace">
+              {/* Section labels */}
+              <text x={50} y={7.5} textAnchor="middle" dominantBaseline="central"
+                fill="rgba(255,255,255,0.035)" fontSize={1.4} fontFamily="monospace"
+                letterSpacing="0.05em">
                 生成阶段 →
               </text>
-              <text x={50} y={69} textAnchor="middle" dominantBaseline="central"
-                fill="rgba(255,255,255,0.04)" fontSize={1.6} fontFamily="monospace">
+              <text x={50} y={70.5} textAnchor="middle" dominantBaseline="central"
+                fill="rgba(255,255,255,0.035)" fontSize={1.4} fontFamily="monospace"
+                letterSpacing="0.05em">
                 ← 提交/卡死检测/循环
               </text>
             </svg>

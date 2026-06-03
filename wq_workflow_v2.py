@@ -23,7 +23,7 @@ WQ 工作流 v2 — 单进程全链路自适应流水线
 import json, time, sys, os, ssl, re, signal, logging, traceback, hashlib
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any, Tuple
+from typing import Optional, Any, Tuple, List
 
 # ═══ Auto-load .env from home directory ═══
 # ⚠️ MUST use os.path.expanduser() not Path.home() — launchd does NOT set HOME env var
@@ -291,39 +291,48 @@ if STATE_FILE.exists():
     _wqdb.export_state_to_db(STATE_FILE)
 
 def load_state() -> dict:
-    """Load workflow state from SQLite."""
+    """Load workflow state from SQLite, with JSON crash-recovery fallback."""
     raw = _wqdb.load_workflow_state(STATE_KEY)
     # Handle old key name "failed_exprs" → migrate to "failed_expressions"
     if "failed_exprs" in raw and "failed_expressions" not in raw:
         raw["failed_expressions"] = raw.pop("failed_exprs")
     if raw:
-        return raw
-    return {
-        "status": "idle",
-        "phase": "init",
-        "current_batch": [],
-        "batch_idx": 0,
-        "active_count": 0,
-        "actives_data": [],
-        "fields_used": {},
-        "candidates_generated": 0,
-        "candidates_passed_is": 0,
-        "candidates_passed_sc": 0,
-        "candidates_submitted": 0,
-        "iterations": 0,
-        "errors": [],
-        "started_at": None,
-        "last_updated": None,
-        "failed_expressions": [],
-        "stuck_batches": 0,
-        "batches_since_optimization": 0,
-        "last_optimization_at": None,
-        # ── v3.19 Skeleton Popularity Tracking ──
-        # Tracks per-skeleton type: success rates, avg sharpe, SC pass rate
-        # Decayed each batch to favor recent performance
-        "skeleton_popularity": {},
-        "skeleton_popularity_decay": 1.0,  # multiplier applied each batch
-    }
+        state = raw
+    else:
+        state = {
+            "status": "idle",
+            "phase": "init",
+            "current_batch": [],
+            "batch_idx": 0,
+            "active_count": 0,
+            "actives_data": [],
+            "fields_used": {},
+            "candidates_generated": 0,
+            "candidates_passed_is": 0,
+            "candidates_passed_sc": 0,
+            "candidates_submitted": 0,
+            "iterations": 0,
+            "errors": [],
+            "started_at": None,
+            "last_updated": None,
+            "failed_expressions": [],
+            "stuck_batches": 0,
+            "batches_since_optimization": 0,
+            "last_optimization_at": None,
+            "skeleton_popularity": {},
+            "skeleton_popularity_decay": 1.0,
+        }
+    # CRASH-RECOVERY: if skeleton_popularity is empty but JSON backup exists, restore
+    try:
+        import os
+        backup_path = os.path.expanduser("~/.wq_skeleton_popularity.json")
+        if os.path.exists(backup_path):
+            backup = json.load(open(backup_path))
+            if not state.get("skeleton_popularity") and backup:
+                state["skeleton_popularity"] = backup
+    except:
+        pass
+    return state
 
 def save_state(state: dict):
     """Save workflow state to SQLite."""
@@ -827,6 +836,231 @@ def _build_ratio_pool(ortho: dict, skip_zero_occupancy: bool = False) -> list:
             pool.append((f"rank({f}/{den})", f"{f}_{den}"))
     
     return pool
+
+
+# ═══ Task 1: Conditional Gating for Cross-Domain Mixing ═══
+
+def _is_temporal_operator(field_expr: str) -> bool:
+    """Check if a string is wrapped in a temporal operator that smooths/transforms coverage.
+    
+    Temporal operators provide time-series alignment that bridges daily/fundamental frequency gaps.
+    """
+    temporal_ops = ["ts_delta(", "ts_zscore(", "ts_rank(", "ts_std(", "ts_mean(", "ts_corr(", "ts_min(", "ts_max("]
+    for op in temporal_ops:
+        if field_expr.startswith(op):
+            return True
+    return False
+
+
+def _build_cross_domain_ratio_pool(ortho: dict, skip_zero_occupancy: bool = False) -> list:
+    """Build cross-domain ratio pairs bridging PV1 (price/volume, daily) and FUND (fundamental, quarterly).
+    
+    Conditional gating rule: at least one side MUST be wrapped in a temporal operator.
+    This provides time-series alignment that reduces coverage mismatch:
+      - rank(ts_delta(close,5) / enterprise_value)       — PV1 numerator temporally smoothed → fund denom
+      - rank(revenue / ts_delta(close,10))               — fund numerator → PV1 denominator temporally smoothed
+      - rank(ts_zscore(volume,20) / operating_income)    — volume volatility → revenue scale
+    
+    Returns format: list of (expr_str, name) compatible with existing ratio pool.
+    """
+    field_usage = ortho["fields_used"]
+    used_pairs = ortho["field_pairs_used"]
+    zero_usage = {"ebitda", "cash", "sales"}
+    
+    pool = []
+    seen = set()
+    
+    # Cross-domain pairs: (temporal_pv1_field, fund_field) and (fund_field, temporal_pv1_field)
+    # Temporal wrapper + PV1 field → fundamental denominator
+    pv1_fields = list(PV1_FIELDS)
+    fund_fields = list(FUND_FIELDS)
+    
+    for temporal_op in ["ts_delta", "ts_zscore", "ts_mean", "ts_std", "ts_rank"]:
+        for period in [3, 5, 7, 10, 15, 20]:
+            for pv1_field in pv1_fields:
+                if pv1_field == "close":  # close used too broadly
+                    continue
+                # Direction 1: temporal(PV1) / FUND
+                cross_expr_1 = f"rank({temporal_op}({pv1_field},{period})/{'/' if True else ''}"
+                # Actually build the full expression correctly
+                cross_expr_1 = f"rank({temporal_op}({pv1_field},{period})"
+                
+                for fund_field in fund_fields:
+                    if skip_zero_occupancy and fund_field in zero_usage:
+                        continue
+                    key = f"{temporal_op}_{pv1_field}_{period}_{fund_field}"
+                    if key in seen:
+                        continue
+                    
+                    expr_1 = f"rank({temporal_op}({pv1_field},{period})/{fund_field})"
+                    # Validate it doesn't contain already-used raw pair
+                    raw_fields = set(FIELD_PATTERN.findall(expr_1))
+                    if len(raw_fields) >= 2:
+                        rp = frozenset(list(raw_fields)[:2])
+                        if rp in used_pairs:
+                            continue
+                    
+                    seen.add(key)
+                    pool.append((expr_1, f"cd_{temporal_op}_{pv1_field}_{fund_field}_p{period}"[:40]))
+                
+                # Direction 2: FUND / temporal(PV1)
+                for fund_field in fund_fields:
+                    if skip_zero_occupancy and fund_field in zero_usage:
+                        continue
+                    key = f"{temporal_op}_rev_{fund_field}_{pv1_field}_{period}"
+                    if key in seen:
+                        continue
+                    
+                    expr_2 = f"rank({fund_field}/{temporal_op}({pv1_field},{period}))"
+                    raw_fields = set(FIELD_PATTERN.findall(expr_2))
+                    if len(raw_fields) >= 2:
+                        rp = frozenset(list(raw_fields)[:2])
+                        if rp in used_pairs:
+                            continue
+                    
+                    seen.add(key)
+                    pool.append((expr_2, f"cd_{temporal_op}_rev_{fund_field}_{pv1_field}_p{period}"[:40]))
+    
+    return pool
+
+
+def _generate_cross_domain_candidates(ratio_pool: list, ortho: dict, active_exprs: list) -> list:
+    """Generate candidates from cross-domain ratio pool using the standard MULT skeleton.
+    
+    These candidates combine cross-domain ratios with standard momentum terms,
+    producing expressions like:
+      rank(ts_delta(close,5)/enterprise_value)*rank(debt/equity)+0.7*rank(ts_mean(adv20,5))
+    """
+    candidates = []
+    momentums = [
+        ("ts_mean(volume,5)", "vol_mom"),
+        ("ts_mean(adv20,5)", "adv_mom"),
+        ("ts_std(returns,5)", "ret_vol"),
+        ("ts_corr(close,volume,10)", "pv_corr"),
+        ("ts_zscore(volume,5)", "vol_zsc"),
+        ("ts_mean(returns,5)", "ret_tre"),
+    ]
+    seen = set()
+    
+    # Build templates from cross-domain pool
+    templates = []
+    template_seen = set()
+    for (r1_str, r1_name) in ratio_pool[:8]:  # More pool size for cross-domain
+        r1_fields = set(FIELD_PATTERN.findall(r1_str))
+        for (r2_str, r2_name) in ratio_pool[:8]:
+            if r1_str == r2_str:
+                continue
+            r2_fields = set(FIELD_PATTERN.findall(r2_str))
+            # Allow some overlap for cross-domain (different field groups by design)
+            all_groups = {_get_field_group(f) for f in (r1_fields | r2_fields)}
+            # For cross-domain, we need at least some structural diversity
+            if len(all_groups) <= 1:
+                continue  # Same domain — let regular pool handle it
+            
+            for mom_str, mom_name in momentums[:4]:
+                tkey = (r1_str, r2_str, mom_str)
+                if tkey in template_seen:
+                    continue
+                template_seen.add(tkey)
+                median_expr = f"{r1_str}*{r2_str}+0.5*rank({mom_str})"
+                score = score_candidate_orthogonality(median_expr, ortho, active_exprs)
+                templates.append({
+                    "r1_str": r1_str, "r1_name": r1_name,
+                    "r2_str": r2_str, "r2_name": r2_name,
+                    "mom_str": mom_str, "mom_name": mom_name,
+                    "score": score,
+                })
+    
+    templates.sort(key=lambda t: -t["score"])
+    
+    for tmpl in templates[:20]:  # Limit to top 20 templates
+        for w in [0.3, 0.5, 0.7]:
+            expr = f"{tmpl['r1_str']}*{tmpl['r2_str']}+{w}*rank({tmpl['mom_str']})"
+            if expr in seen:
+                continue
+            seen.add(expr)
+            name = f"CD_{tmpl['r1_name']}_{tmpl['r2_name']}_w{int(w*10)}"[:40]
+            name = name.replace("-", "_").replace(" ", "")
+            candidates.append({
+                "name": name, "expr": expr,
+                "orthogonality_score": tmpl["score"],
+                "skeleton": SKELETON_CROSS_GATE,  # New skeleton type for cross-gate
+                "weight": w,
+            })
+    
+    candidates.sort(key=lambda x: -x["orthogonality_score"])
+    return candidates
+
+
+def _generate_temporal_wrap_candidates(ortho: dict, active_exprs: list) -> list:
+    """Generate candidates by wrapping verified fundamental ratios in high-order temporal operators.
+    
+    This is a pure cross-domain approach: take proven fund ratios and wrap them in
+    ts_*, sign(), or residual operations to create temporal signatures.
+    
+    Examples:
+      ts_delta(rank(revenue/enterprise_value), 5)
+      sign(ts_delta(revenue/enterprise_value, 3)) * rank(ts_mean(returns, 5))
+      ts_zscore(rank(debt/equity), 10)
+    """
+    candidates = []
+    seen = set()
+    
+    # Use only fundamental ratio pairs (same domain, no mixing)
+    for num, den in VERIFIED_NUM_DEN_PAIRS:
+        if num in {"ebitda", "cash", "sales"} or den in {"ebitda", "cash", "sales"}:
+            continue
+        
+        ratio_expr = f"rank({num}/{den})"
+        
+        # Topology A: ts_delta of ratio → captures fundamental change rate
+        for period in [3, 5, 10]:
+            expr = f"ts_delta({ratio_expr}, {period})"
+            if expr not in seen:
+                seen.add(expr)
+                score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                candidates.append({
+                    "name": f"TWA_delta_{num[:3]}{den[:3]}_p{period}"[:40],
+                    "expr": expr,
+                    "orthogonality_score": score,
+                    "skeleton": SKELETON_NONLINEAR_BREAKER,
+                    "weight": 1.0,
+                })
+        
+        # Topology B: ts_zscore of ratio → captures extreme fundamental deviation
+        for period in [10, 20]:
+            expr = f"ts_zscore({ratio_expr}, {period})"
+            if expr not in seen:
+                seen.add(expr)
+                score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                candidates.append({
+                    "name": f"TWA_zscore_{num[:3]}{den[:3]}_p{period}"[:40],
+                    "expr": expr,
+                    "orthogonality_score": score,
+                    "skeleton": SKELETON_DEEP_CASCADE,
+                    "weight": 1.0,
+                })
+        
+        # Topology C: sign(ts_delta(ratio)) * rank(pv1_momentum) — cross-domain interaction
+        for period in [3, 5]:
+            for mom_expr, mom_name in [("ts_mean(volume,5)", "vol_mom"), 
+                                         ("ts_mean(adv20,5)", "adv_mom"),
+                                         ("ts_std(returns,5)", "ret_vol")]:
+                expr = f"sign(ts_delta({ratio_expr}, {period})) * rank({mom_expr})"
+                if expr not in seen:
+                    seen.add(expr)
+                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                    candidates.append({
+                        "name": f"TWA_sign_{num[:3]}{den[:3]}_{mom_name}_p{period}"[:40],
+                        "expr": expr,
+                        "orthogonality_score": score,
+                        "skeleton": SKELETON_SIGN_SWITCH,
+                        "weight": 1.0,
+                    })
+    
+    candidates.sort(key=lambda x: -x["orthogonality_score"])
+    return candidates
+
 
 def _generate_mult_candidates(ratio_pool: list, ortho: dict, active_exprs: list) -> list:
     """Generate multiplication skeleton candidates: rank(A/B)*rank(C/D)+W*rank(M).
@@ -1738,6 +1972,21 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     #             c["skeleton"] = skel_type
     #         all_candidates.extend(advanced)
 
+    # ── Task 1: Cross-domain conditional gating generators ──
+    # Build cross-domain ratio pool: temporal(PV1)/FUND or FUND/temporal(PV1)
+    cross_pool = _build_cross_domain_ratio_pool(ortho, skip_zero_occupancy=(stuck_batches >= 2))
+    if cross_pool:
+        log(f"  🌐 Cross-domain pool: {len(cross_pool)} ratio pairs (temporal gating enabled)")
+        cross_candidates = _generate_cross_domain_candidates(cross_pool, ortho, active_exprs)
+        log(f"  🌐 Adding {len(cross_candidates)} cross-domain MULT candidates")
+        all_candidates.extend(cross_candidates)
+    
+    # Temporal wrap candidates: proven fund ratios + high-order temporal operators
+    tw_candidates = _generate_temporal_wrap_candidates(ortho, active_exprs)
+    if tw_candidates:
+        log(f"  ⏳ Adding {len(tw_candidates)} temporal-wrap candidates (ts_delta/zscore/sign)")
+        all_candidates.extend(tw_candidates)
+
     if not all_candidates:
         log("  ⚠️ No candidates generated!", "error")
         return []
@@ -1758,7 +2007,7 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     # ── StructuralDistanceMatrix for scoring (P2 + P7: topological distance in scoring) ──
     sdm = StructuralDistanceMatrix()
     # Pre-compute features for all known expressions (failed + active)
-    known_for_dist = list(seen_exprs) | set(active_exprs)
+    known_for_dist = set(seen_exprs) | set(active_exprs)
     for _e in list(known_for_dist):
         if _e:
             sdm.extract_features(_e)
@@ -2280,7 +2529,9 @@ def adaptive_poll(session, url: str, poll_name: str,
                         last_progress = current_progress
             elif r.status_code == 429:
                 retry = int(r.headers.get("Retry-After", 60))
-                log(f"⚠️ 429: waiting {retry}s")
+                # Add jitter to avoid thundering herd, cap at 300s to avoid excessive waits
+                retry = min(retry, 300)
+                log(f"⚠️ 429: waiting {retry}s (Retry-After: {int(r.headers.get('Retry-After', 60))})")
                 time.sleep(retry)
                 continue
         except Exception as e:
@@ -2386,6 +2637,261 @@ def notify(message: str, emoji: str = "ℹ️", dedup_key: str = None):
             log(f"📬 Notify: HTTP {r.status_code} {r.text[:80]}")
     except Exception as e:
         log(f"📬 Notify error: {e}")
+
+
+# ═══ Task 2: Dynamic Skeleton Builder — AST Topology Mutation Engine ═══
+
+class DynamicSkeletonBuilder:
+    """AST拓扑变异引擎 — 动态组合截面算子与时序破坏算子，打破固定骨架瓶颈。
+    
+    核心设计：
+    1. 不再写死 rank(A/B)*rank(C/D)+W*rank(M) 等模板
+    2. 动态随机组合"截面算子"与"时序破坏算子（破坏平滑性）"
+    3. 每个候选必须有至少一个 ts_* 算子（零 S=None 风险）
+    4. 支持拓扑变异：对已有表达式进行 AST 级结构变异
+    
+    拓扑模板：
+    - cross_gate: rank(pv1_signal) * sign(ts_delta(fund_ratio, N))
+    - nested_tsrank_corr: ts_rank(ts_corr(rank(A), rank(B), N1), N2)
+    - volume_ratio_breaker: ts_argmax(volume, N) / ts_argmax(volume, 2N) * rank(A/B)
+    - dual_delta_cross: ts_delta(rank(fund1), N) * ts_delta(rank(fund2), M)
+    - residual_rank: ts_rank(ts_residual(close, returns, N), M)
+    """
+    
+    # 高级时序算子工厂 — 返回表达式字符串
+    TS_OPERATORS = [
+        # 时序差分 — 破坏平滑性，捕获一阶变化
+        lambda f, n: f"ts_delta({f}, {n})",
+        # 时序z-score — 捕获极端偏离
+        lambda f, n: f"ts_zscore({f}, {n})",
+        # 时序排名 — 将绝对值转为相对排名
+        lambda f, n: f"ts_rank({f}, {n})",
+        # 时序波动率 — 捕获波动变化
+        lambda f, n: f"ts_std({f}, {n})",
+        # 时序相关性 — 捕获共动性
+        lambda f, n: f"ts_corr(close, {f}, {n})",
+        # 时序均值 — 平滑但保留时序性
+        lambda f, n: f"ts_mean({f}, {n})",
+        # 时序极值 — 捕获极值突破
+        lambda f, n: f"ts_argmax({f}, {n})",
+        # 时序残差 — 捕获回归残差
+        lambda f, n: f"ts_residual({f}, returns, {n})",
+    ]
+    
+    # 截面算子 — 提供截面排序信号
+    CROSS_SECTION_OPS = [
+        lambda a, b: f"rank({a}/{b})",       # 比率排名
+        lambda a, b: f"rank({a})/{b}",        # 不推荐 — 混合类型
+    ]
+    
+    # 时序窗口周期
+    PERIODS = [3, 5, 7, 10, 15, 20]
+    
+    def __init__(self, seed=None):
+        """初始化构建器，可选随机种子用于可复现性。"""
+        self._seed = seed
+    
+    def generate_topology_candidates(self, ratio_pool, ortho, active_exprs, max_count=30):
+        """从 ratio pool 生成拓扑变异的候选表达式。
+        
+        对 pool 中的每个 ratio pair，应用 5 种拓扑模板，
+        每个模板随机选取周期和截面算子组合。
+        
+        Returns: list of candidate dicts with expr, name, orthogonality_score, skeleton
+        """
+        candidates = []
+        seen = set()
+        
+        for ratio_str, ratio_name in ratio_pool[:10]:
+            # Topology 1: cross_gate — rank(PV1_signal) * sign(ts_delta(fund_ratio, N))
+            for period in self.PERIODS:
+                # 从 ratio 中提取字段，找 PV1 字段
+                pv1_fields = [f for f in FIELD_PATTERN.findall(ratio_str) if f in PV1_FIELDS]
+                fund_fields = [f for f in FIELD_PATTERN.findall(ratio_str) if f in FUND_FIELDS]
+                
+                for pv1_f in pv1_fields[:2]:
+                    for fund_r in [ratio_str] if ratio_name.startswith("cd_") else fund_fields[:1]:
+                        # 表达式：sign(ts_delta(fund_ratio, N)) * rank(ts_delta(pv1, M))
+                        temp_op = self.TS_OPERATORS[0]  # ts_delta
+                        expr = f"sign({temp_op(fund_r, period)}) * rank({temp_op(pv1_f, 5)})"
+                        if expr not in seen and len(expr) < 200:
+                            seen.add(expr)
+                            score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                            candidates.append({
+                                "name": f"DSB_gate_{ratio_name[:12]}_p{period}"[:40],
+                                "expr": expr,
+                                "orthogonality_score": score,
+                                "skeleton": SKELETON_CROSS_GATE,
+                                "weight": 1.0,
+                            })
+            
+            # Topology 2: dual_delta_cross — ts_delta(rank(A/B), N) * ts_delta(rank(C/D), M)
+            # 利用同一骨架的两个比率做交叉差分
+            fund_fields_in_ratio = [f for f in FIELD_PATTERN.findall(ratio_str) if f in FUND_FIELDS]
+            if len(fund_fields_in_ratio) >= 2:
+                for p1 in [3, 5]:
+                    for p2 in [7, 10]:
+                        expr = f"ts_delta({ratio_str}, {p1}) + ts_delta(rank({fund_fields_in_ratio[0]}), {p2})"
+                        if expr not in seen and len(expr) < 200:
+                            seen.add(expr)
+                            score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                            candidates.append({
+                                "name": f"DSB_dual_{ratio_name[:8]}_p{p1}{p2}"[:40],
+                                "expr": expr,
+                                "orthogonality_score": score,
+                                "skeleton": SKELETON_DEEP_CASCADE,
+                                "weight": 1.0,
+                            })
+            
+            # Topology 3: residual_rank — ts_rank(ts_residual(ratio, returns, N), M)
+            for n in [10, 20]:
+                for m in [5, 10]:
+                    expr = f"ts_rank(ts_residual({ratio_str}, returns, {n}), {m})"
+                    if expr not in seen and len(expr) < 200:
+                        seen.add(expr)
+                        score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                        candidates.append({
+                            "name": f"DSB_residual_{ratio_name[:8]}_n{n}_m{m}"[:40],
+                            "expr": expr,
+                            "orthogonality_score": score,
+                            "skeleton": SKELETON_RESIDUAL,
+                            "weight": 1.0,
+                        })
+        
+        # Topology 4: nested_tsrank_corr — ts_rank(ts_corr(rank(A/B), rank(C/D), N1), N2)
+        # 只对有足够比率对的场景生成
+        if len(ratio_pool) >= 4:
+            for i in range(min(3, len(ratio_pool) - 1)):
+                for j in range(i + 1, min(4, len(ratio_pool))):
+                    r1 = ratio_pool[i][0]
+                    r2 = ratio_pool[j][0]
+                    f1_fields = FIELD_PATTERN.findall(r1)
+                    f2_fields = FIELD_PATTERN.findall(r2)
+                    if not (f1_fields and f2_fields):
+                        continue
+                    # 确保两个比率至少有一个字段不同
+                    if set(f1_fields) & set(f2_fields):
+                        # 有重叠字段，跳过避免完全相关
+                        continue
+                    for n1 in [10, 15]:
+                        for n2 in [5, 10]:
+                            expr = f"ts_rank(ts_corr({r1}, {r2}, {n1}), {n2})"
+                            if expr not in seen and len(expr) < 250:
+                                seen.add(expr)
+                                score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                                candidates.append({
+                                    "name": f"DSB_nested_{ratio_pool[i][1][:6]}_{ratio_pool[j][1][:6]}"[:40],
+                                    "expr": expr,
+                                    "orthogonality_score": score,
+                                    "skeleton": SKELETON_TSRANK_CORR,
+                                    "weight": 1.0,
+                                })
+        
+        # Topology 5: zscore_of_ratio — ts_zscore(rank(A/B), N) — 基本面偏离度
+        for ratio_str, ratio_name in ratio_pool[:10]:
+            for period in [10, 20, 30]:
+                expr = f"ts_zscore({ratio_str}, {period})"
+                if expr not in seen and len(expr) < 200:
+                    seen.add(expr)
+                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
+                    candidates.append({
+                        "name": f"DSB_zscore_{ratio_name[:10]}_p{period}"[:40],
+                        "expr": expr,
+                        "orthogonality_score": score,
+                        "skeleton": SKELETON_NONLINEAR_BREAKER,
+                        "weight": 1.0,
+                    })
+        
+        candidates.sort(key=lambda x: -x["orthogonality_score"])
+        return candidates[:max_count]
+    
+    def mutate_expr_topology(self, expr, ortho, active_exprs, max_variants=10):
+        """对已有表达式进行 AST 级拓扑变异，打破自相关性。
+        
+        变异策略：
+        1. 在外层包裹 ts_delta — 将 Level 信号转为 Delta 信号
+        2. 在外层包裹 ts_zscore — 将 Level 信号转为 Extreme 信号
+        3. 在外层包裹 ts_rank — 将 Level 信号转为 Rank 信号
+        4. 替换最外层的 ts_mean 为 ts_delta — 破坏平滑性
+        5. 在最外层加 ind_neutralize — 剥离行业暴露
+        
+        Returns: list of mutated candidate dicts
+        """
+        mutations = []
+        seen = set()
+        
+        # Mutation 1: ts_delta(expr, N)
+        for n in [3, 5, 10]:
+            mut = f"ts_delta({expr}, {n})"
+            if mut not in seen:
+                seen.add(mut)
+                mutations.append({
+                    "name": f"mut_delta_{n}",
+                    "expr": mut,
+                    "orthogonality_score": ortho.get("_last_score", 0),
+                    "skeleton": SKELETON_NONLINEAR_BREAKER,
+                })
+        
+        # Mutation 2: ts_zscore(expr, N)
+        for n in [10, 20]:
+            mut = f"ts_zscore({expr}, {n})"
+            if mut not in seen:
+                seen.add(mut)
+                mutations.append({
+                    "name": f"mut_zscore_{n}",
+                    "expr": mut,
+                    "orthogonality_score": ortho.get("_last_score", 0),
+                    "skeleton": SKELETON_DEEP_CASCADE,
+                })
+        
+        # Mutation 3: ts_rank(expr, N)
+        for n in [5, 10, 20]:
+            mut = f"ts_rank({expr}, {n})"
+            if mut not in seen:
+                seen.add(mut)
+                mutations.append({
+                    "name": f"mut_rank_{n}",
+                    "expr": mut,
+                    "orthogonality_score": ortho.get("_last_score", 0),
+                    "skeleton": SKELETON_TSRANK_CORR,
+                })
+        
+        # Mutation 4: ts_residual(expr, returns, N)
+        for n in [10, 20]:
+            mut = f"ts_residual({expr}, returns, {n})"
+            if mut not in seen:
+                seen.add(mut)
+                mutations.append({
+                    "name": f"mut_residual_{n}",
+                    "expr": mut,
+                    "orthogonality_score": ortho.get("_last_score", 0),
+                    "skeleton": SKELETON_RESIDUAL,
+                })
+        
+        # Mutation 5: ind_neutralize(expr, IndClass.subindustry)
+        mut = f"ind_neutralize({expr}, IndClass.subindustry)"
+        if mut not in seen:
+            seen.add(mut)
+            mutations.append({
+                "name": "mut_ind_neut",
+                "expr": mut,
+                "orthogonality_score": ortho.get("_last_score", 0) + 3,
+                "skeleton": SKELETON_IND_NEUT,
+            })
+        
+        # Mutation 6: expr - ts_mean(expr, 5) (residual differencing)
+        mut = f"{expr} - ts_mean({expr}, 5)"
+        if mut not in seen and len(mut) < 250:
+            seen.add(mut)
+            mutations.append({
+                "name": "mut_diff_mean5",
+                "expr": mut,
+                "orthogonality_score": ortho.get("_last_score", 0),
+                "skeleton": SKELETON_RESIDUAL,
+            })
+        
+        mutations.sort(key=lambda x: -x["orthogonality_score"])
+        return mutations[:max_variants]
 
 
 # ═══ WORKFLOW PHASES ══════════════════════════════
@@ -2788,8 +3294,10 @@ class Workflow:
 
         if r.status_code == 429:
             retry = int(r.headers.get("Retry-After", 900))
-            log(f"⚠️ 429: waiting {min(retry, 120)}s")
-            time.sleep(min(retry, 120))
+            # Cap at 120s to avoid excessive waits
+            wait = min(retry, 120)
+            log(f"⚠️ 429: waiting {wait}s (Retry-After: {retry})")
+            time.sleep(wait)
             try:
                 r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
             except Exception as e:
@@ -2956,9 +3464,9 @@ class Workflow:
         sc_result, self.s = adaptive_poll(
             self.s, f"{API}/alphas/{alpha_id}",
             f"SC {cand['name']}",
-            sc_ready, max_wait=7200,  # 2h (was 4h) — reduce wall-clock waste
+            sc_ready, max_wait=7200,  # 2h — SC can take 30-60+ min on congested queues
             initial_interval=30, fallback_interval=120,
-            stuck_threshold=1800  # abort if stuck at same progress for 30 min
+            stuck_threshold=5400  # abort only if stuck at same % for 90 min (SC is slow)
         )
         
         # Handle early abort from stuck detection
@@ -3132,8 +3640,9 @@ class Workflow:
                 
                 elif r.status_code == 429:
                     retry = int(r.headers.get("Retry-After", 60))
-                    log(f"⚠️ 429 on probe, waiting {retry}s", "warn")
-                    time.sleep(retry)
+                    wait = min(retry, 120)
+                    log(f"⚠️ 429 on probe, waiting {wait}s (Retry-After: {retry})", "warn")
+                    time.sleep(wait)
                     continue
                 
                 else:
@@ -3245,8 +3754,9 @@ class Workflow:
         
         if r.status_code == 429:
             retry = int(r.headers.get("Retry-After", 60))
-            log(f"    ⚠️ 429: wait {min(retry, 60)}s")
-            time.sleep(min(retry, 60))
+            wait = min(retry, 60)
+            log(f"    ⚠️ 429: wait {wait}s (Retry-After: {retry})")
+            time.sleep(wait)
             try:
                 r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
             except:
@@ -3363,6 +3873,19 @@ class Workflow:
         # Weighted score: pass_rate * avg_sharpe * sc_bonus
         sc_bonus = 1.0 + sk_data.get("sc_pass_rate", 0) * 2
         sk_data["weighted_score"] = sk_data["is_pass_rate"] * sk_data["avg_sharpe"] * sc_bonus
+        # Write immediate backup to JSON file for crash recovery
+        try:
+            import json, os
+            backup_path = os.path.expanduser("~/.wq_skeleton_popularity.json")
+            try:
+                existing = json.load(open(backup_path))
+            except:
+                existing = {}
+            existing[sk] = sk_data
+            with open(backup_path, 'w') as f:
+                json.dump(existing, f)
+        except:
+            pass  # Don't let backup failure break the main flow
     
     def _apply_skeleton_decay(self):
         """Apply recency decay to skeleton popularity each batch."""
@@ -3568,21 +4091,26 @@ class Workflow:
                     _generate_new_ratio_variations(cand, variations, ortho, max_tune_attempts)
 
         elif failed_phase == "sc":
-            # ── SC fail: try neutralization dimension degradation first (v3.19) ──
-            # WQ SELF_CORRELATION checks residual correlation in the same neutralization space.
-            # INDUSTRY is the coarsest layer; SECTOR/SUBINDUSTRY peel finer granularity,
-            # potentially eliminating pseudo-correlation and turning SC fail → pass.
-            # Strategy: reuse the SAME expression (preserve IS metrics), try finer dims.
+            # ── SC fail: AST residual pruning (v4 — Task 3) ──
+            # 核心思想：SC 失败不是字段问题，而是结构自相关太高。
+            # 不要换字段，而是对原表达式做 AST 级残差化修剪，打破自相关模式。
+            # 保留 IS 验证过的信号质量，只修改自相关结构。
+            
             base_expr = cand.get("expr", "")
             base_name = cand.get("name", "orig")
-            if base_expr:
-                log(f"  🔍 SC neutralization degradation: testing SECTOR / SUBINDUSTRY on '{base_name}'")
+            if not base_expr:
+                log(f"  ⚠️ SC fail: no base expr, skipping", "warn")
+            else:
+                log(f"  🔬 SC AST residual pruning on '{base_name}': {base_expr[:80]}")
+                
+                # Phase 1: Neutralization dimension degradation (keep existing logic — proven effective)
+                # 最细粒度的中性化可能消除伪相关
+                log(f"  🔍 Phase 1: Neutralization degradation (SECTOR/SUBINDUSTRY)")
                 for ndim in ["SECTOR", "SUBINDUSTRY"]:
                     if not self.running:
                         return False
                     var_name = f"{base_name}_neut_{ndim}"[:40]
                     log(f"    Attempt {ndim} neutralization...")
-                    # Override neutralization dimension for this sim
                     override = dict(DEFAULT_SETTINGS) if settings_override else dict(DEFAULT_SETTINGS)
                     override["neutralization"] = ndim
                     payload = {"type": "REGULAR", "regular": base_expr, "settings": override}
@@ -3590,33 +4118,55 @@ class Workflow:
                     if success:
                         return True
                     else:
-                        log(f"    {ndim} neutralization also failed, continuing to next dim")
-
-            # ── Neutralization degradation exhausted → try different field pairs (legacy) ──
-            # SC failure: try entirely different field pairs
-            # Use the orthogonality data to find the most orthogonal field combinations
+                        log(f"    {ndim} neutralization failed")
+            
+            # Phase 2: AST residual pruning — 对原表达式做拓扑变异，而非换字段
+            # 这是关键创新：SC 失败是因为信号模式太"干净"，被 SC 检测为自相关
+            # 通过残差化（差分/z-score/排名）破坏模式重复性，保留信号本质
+            if base_expr:
+                builder = DynamicSkeletonBuilder()
+                ast_mutations = builder.mutate_expr_topology(base_expr, ortho, active_exprs, max_variants=8)
+                if ast_mutations:
+                    log(f"  🔧 Phase 2: AST residual pruning — {len(ast_mutations)} mutations generated")
+                    for mut in ast_mutations:
+                        if not self.running:
+                            return False
+                        var_name = f"{base_name}_mut_{mut['name']}"[:40]
+                        log(f"    Mutation: {mut['name']} → {mut['expr'][:100]}")
+                        
+                        # 确保表达式长度合理
+                        if len(mut["expr"]) > 300:
+                            log(f"      ⚠️ Expr too long ({len(mut['expr'])} chars), skipping")
+                            continue
+                        
+                        override = dict(DEFAULT_SETTINGS) if settings_override else dict(DEFAULT_SETTINGS)
+                        payload = {"type": "REGULAR", "regular": mut["expr"], "settings": override}
+                        success = self._run_single_sim_and_sc(var_name, payload, cand, failed_phase, max_tune_attempts, is_optimization)
+                        if success:
+                            log(f"  ✅ SC passed after AST mutation: {mut['name']}")
+                            return True
+                        else:
+                            log(f"    Mutation {mut['name']} SC failed")
+            
+            # Phase 3: If AST pruning failed, fall back to legacy field pair swap
+            # 保留原有逻辑作为兜底
+            log(f"  ⚠️ Phase 3: AST pruning exhausted — falling back to field pair swap")
             field_usage = ortho["fields_used"]
             used_pairs = ortho.get("field_pairs_used", set())
-
-            # Only use proven denominators — no zero-coverage fields (sales → S=None)
-            # and respect time-frequency compatibility (pv1×fund mixing → S=None)
+            
             fund_denoms = ["cap", "enterprise_value", "equity"]
             pv1_denoms = ["close", "volume", "adv20", "vwap", "low", "high", "open"]
-            denoms = fund_denoms + pv1_denoms
             denoms = [d for d in denoms if field_usage.get(d, 0) <= 2]
-
+            
             fund_nums = ["revenue", "operating_income", "debt"]
             pv1_nums = ["returns", "volume", "low", "high"]
-            nums = fund_nums + pv1_nums
-            nums = [n for n in nums if field_usage.get(n, 0) <= 1]
-            nums = [n for n in nums if n not in ["close"]]  # exclude close (too common)
-
+            nums = [n for n in fund_nums + pv1_nums if field_usage.get(n, 0) <= 1 and n not in ["close"]]
+            
             mom_pool = [
                 ("ts_mean(volume,5)", "vol_mom"),
                 ("ts_mean(adv20,5)", "adv_mom"),
                 ("log(volume)", "log_vol"),
             ]
-            # NOTE: "ts_std(returns,5)" removed from all pools — always stalls at 0%
             
             pair_count = 0
             for num in nums[:6]:
@@ -3626,7 +4176,6 @@ class Workflow:
                     pair = frozenset([num, den])
                     if pair in used_pairs:
                         continue
-                    # Time-frequency compatibility: don't mix pv1 num with fund den or vice versa
                     g1 = "fund" if num in FUND_FIELDS else "pv1"
                     g2 = "fund" if den in FUND_FIELDS else "pv1"
                     if g1 != g2:
@@ -3639,10 +4188,8 @@ class Workflow:
                             if den2 == den or num2 == den2:
                                 continue
                             pair2 = frozenset([num2, den2])
-                            # Ensure no field overlap between the two ratios
                             if {num, den} & {num2, den2}:
                                 continue
-                            # Time-frequency compatibility for second pair
                             g1b = "fund" if num2 in FUND_FIELDS else "pv1"
                             g2b = "fund" if den2 in FUND_FIELDS else "pv1"
                             if g1b != g2b:
@@ -3666,8 +4213,6 @@ class Workflow:
                                 break
                         if pair_count >= max_tune_attempts:
                             break
-                    if pair_count >= max_tune_attempts:
-                        break
                 if pair_count >= max_tune_attempts:
                     break
         
@@ -3702,8 +4247,9 @@ class Workflow:
             
             if r.status_code == 429:
                 retry = int(r.headers.get("Retry-After", 60))
-                log(f"    ⚠️ 429: wait {retry}s")
-                time.sleep(min(retry, 60))
+                wait = min(retry, 60)
+                log(f"    ⚠️ 429: wait {wait}s (Retry-After: {retry})")
+                time.sleep(wait)
                 try:
                     r = self.s.post(f"{API}/simulations", json=payload, timeout=90)
                 except:
