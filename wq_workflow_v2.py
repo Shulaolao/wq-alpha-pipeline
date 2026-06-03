@@ -2021,6 +2021,15 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     if tw_candidates:
         log(f"  ⏳ Adding {len(tw_candidates)} temporal-wrap candidates (ts_delta/zscore/sign)")
         all_candidates.extend(tw_candidates)
+    
+    # ── v4 Task 2: DSB Dynamic Skeleton Builder — AST Topology Mutation ──
+    # generate_topology_candidates was defined but never integrated.
+    # Now called after cross-domain pools to add diverse AST-topology candidates.
+    dsb = DynamicSkeletonBuilder()
+    top_candidates = dsb.generate_topology_candidates(ratio_pool, ortho, active_exprs, max_count=15)
+    if top_candidates:
+        log(f"  🧬 Adding {len(top_candidates)} DSB topology-mutated candidates")
+        all_candidates.extend(top_candidates)
 
     if not all_candidates:
         log("  ⚠️ No candidates generated!", "error")
@@ -2140,27 +2149,21 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         SKELETON_PURE_MULT: 0,
         SKELETON_SUB: 0,
         SKELETON_SINGLE: 0,
+        SKELETON_CROSS_GATE: 0,
+        SKELETON_SIGN_SWITCH: 0,
+        SKELETON_NONLINEAR_BREAKER: 0,
+        SKELETON_TSRANK_CORR: 0,
+        SKELETON_TREND_BREAK: 0,
+        SKELETON_VOL_ADJ: 0,
+        SKELETON_RESIDUAL: 0,
+        SKELETON_DEEP_CASCADE: 0,
         "other": 0,
     }
     if failed_exprs:
         for fe in failed_exprs:
-            if "ind_neutral" in fe:
-                failed_skeleton_counts[SKELETON_IND_NEUT] += 1
-            elif "*" in fe and "+" in fe and "/" in fe:
-                # MULT: rank(A/B)*rank(C/D)+W*rank(M)
-                failed_skeleton_counts[SKELETON_MULT] += 1
-            elif "*" in fe and "+" not in fe and "/" in fe:
-                # PURE_MULT: rank(A/B)*rank(C/D)
-                failed_skeleton_counts[SKELETON_PURE_MULT] += 1
-            elif "ts_" in fe and "/" in fe:
-                # THREE_TERM: rank(A/B)+rank(C/D)-rank(ts_*(X,N))
-                failed_skeleton_counts[SKELETON_THREE_TERM] += 1
-            elif "ts_" in fe and "/" not in fe and ("+" in fe or "-" in fe):
-                # DIRECT_RANK: rank(A) +/- W*rank(ts_*(B,N))
-                failed_skeleton_counts[SKELETON_DIRECT_RANK] += 1
-            elif "-" in fe and "/" not in fe and "ts_" in fe:
-                # SUB: rank(fund) - rank(ts_delta(pv1))
-                failed_skeleton_counts[SKELETON_SUB] += 1
+            sk = _classify_v3_skeleton(fe)
+            if sk in failed_skeleton_counts:
+                failed_skeleton_counts[sk] += 1
             else:
                 failed_skeleton_counts["other"] += 1
     
