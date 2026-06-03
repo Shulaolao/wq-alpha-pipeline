@@ -2169,39 +2169,6 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     
     log(f"  📊 Failed pool skeleton distribution: {dict((k, v) for k, v in failed_skeleton_counts.items() if v > 0)}")
     
-    # Base rotation on stuck_batches, but override based on actual failed skeleton distribution
-    rotation_phase = stuck_batches % 3
-    
-    # If MULT dominates failed pool, rotate away from MULT
-    mult_count = failed_skeleton_counts[SKELETON_MULT]
-    dr_count = failed_skeleton_counts[SKELETON_DIRECT_RANK]
-    three_term_count = failed_skeleton_counts[SKELETON_THREE_TERM]
-    ind_neut_count = failed_skeleton_counts[SKELETON_IND_NEUT]
-    total_failed = sum(failed_skeleton_counts.values())
-    
-    if mult_count > total_failed * 2 // 3 and total_failed >= 3:
-        log(f"  🔄 Skeleton analysis: MULT={mult_count}, DR={dr_count}, 3T={three_term_count}, IND_NEUT={ind_neut_count}")
-        if rotation_phase == 0:
-            rotation_phase = 1
-            log(f"  ⚡ MULT dominates failed pool → forcing rotation to Phase 1 (DIRECT_RANK)")
-        elif rotation_phase == 2:
-            rotation_phase = 1
-            log(f"  ⚡ MULT dominates failed pool → forcing rotation to Phase 1 (DIRECT_RANK)")
-    # If DIRECT_RANK dominates, skip to Phase 2 (mixed exploration)
-    elif dr_count > total_failed * 2 // 3 and dr_count >= 3:
-        log(f"  🔄 Skeleton analysis: MULT={mult_count}, DR={dr_count}, 3T={three_term_count}, IND_NEUT={ind_neut_count}")
-        if rotation_phase <= 1:
-            rotation_phase = 2
-            log(f"  ⚡ DIRECT_RANK dominates failed pool → skipping to Phase 2 (mixed exploration)")
-    # If THREE_TERM dominates, skip to Phase 0 with MULT exhaustion override
-    elif three_term_count > total_failed * 2 // 3 and three_term_count >= 3:
-        log(f"  🔄 THREE_TERM dominates failed pool → forcing Phase 0 reset (with exhaustion)")
-        rotation_phase = 0
-    # If IND_NEUT dominates, skip to Phase 1 (DIRECT_RANK is next exploration target)
-    elif ind_neut_count > 0 and ind_neut_count >= 2 and total_failed >= 4:
-        log(f"  🔄 IND_NEUT={ind_neut_count} in failed pool → forcing Phase 1 (DIRECT_RANK)")
-        rotation_phase = 1
-    
     # Split candidates by skeleton type for targeted selection
     skeleton_groups = {}
     for c in deduped:
@@ -2240,16 +2207,17 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
             mult_exhausted = True
             log(f"  🔄 MULT exhausted: {exhausted_count}/{total_templates} templates fully tested, skipping")
     
-    # ── v3.19 Enhanced Skeleton Rotation (P4: 7-group rotation) ──
+    # v3.19 Enhanced Skeleton Rotation (P4: 7-group rotation)
     # Extended from 3-phase to 7-skeleton groups with adaptive phase shifting
-    
-    # Build failed pool skeleton counts using v3 classifier for accuracy
-    failed_skeleton_counts = {}
+
+    # Merge v3 classifier results into the existing comprehensive dict
+    # (Preserves the 15-key dictionary built above instead of rebuilding from scratch)
     if failed_exprs:
         for fe in failed_exprs:
             sk = _classify_v3_skeleton(fe)
-            failed_skeleton_counts[sk] = failed_skeleton_counts.get(sk, 0) + 1
-    
+            if sk not in failed_skeleton_counts:
+                # v3 returned a type not in our predefined list — add it
+                failed_skeleton_counts[sk] = failed_skeleton_counts.get(sk, 0) + 1
     total_failed = sum(failed_skeleton_counts.values())
     
     # Adaptive rotation: shift phase if any skeleton dominates the failed pool
@@ -2260,6 +2228,7 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     for sk, cnt in failed_skeleton_counts.items():
         if cnt > total_failed * 2 // 3 and total_failed >= 3:
             # This skeleton is overused → skip to the next unexplored group
+            # Map ALL skeleton types to rotation phases for dominance override
             phase_map = {
                 SKELETON_MULT: 0,
                 SKELETON_DIRECT_RANK: 1,
@@ -2267,6 +2236,15 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
                 SKELETON_IND_NEUT: 3,
                 SKELETON_PURE_MULT: 4,
                 SKELETON_SUB: 5,
+                SKELETON_CROSS_GATE: 0,    # cross_gate treated as mult exploration
+                SKELETON_SIGN_SWITCH: 1,   # sign_switch → direct_rank
+                SKELETON_NONLINEAR_BREAKER: 2,
+                SKELETON_TSRANK_CORR: 2,
+                SKELETON_TREND_BREAK: 2,
+                SKELETON_VOL_ADJ: 3,
+                SKELETON_DEEP_CASCADE: 3,
+                SKELETON_RESIDUAL: 4,
+                SKELETON_SINGLE: 5,
                 "other": 6,
             }
             current_sk_phase = phase_map.get(sk, 6)
@@ -2275,22 +2253,23 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
             log(f"  🔄 Skeleton dominance: {sk}={cnt}/{total_failed} → rotate to phase {rotation_phase}")
             break
     
-    log(f"  📊 Failed pool skeleton distribution: {dict((k, v) for k, v in failed_skeleton_counts.items() if v > 0)}")
     log(f"  🔄 Rotation phase: {rotation_phase} (stuck_batches={stuck_batches}, override={rotation_override})")
     
     # ── v3.19 Selection with Intra-Batch Diversity (P5) ──
     # Instead of taking n consecutive candidates from one skeleton group,
     # use a round-robin approach across skeleton types to ensure diversity.
     
-    # Phase mapping: each phase has a primary skeleton + secondary skeletons
-    # Only includes active generators (CROSS_GATE, SIGN_SWITCH, VOL_ADJ, DEEP_CASCADE are disabled)
+    # Phase mapping: each phase has a primary skeleton + secondary skeletons.
+    # Phase mapping includes all active generators (CROSS_GATE, SIGN_SWITCH, VOL_ADJ, DEEP_CASCADE enabled in v4).
+    # 7 phases (0-6) for 7-group rotation; phase 6 = fallback to residual/deep exploration.
     phase_map = {
         0: (SKELETON_MULT, [SKELETON_DIRECT_RANK, SKELETON_THREE_TERM]),
         1: (SKELETON_DIRECT_RANK, [SKELETON_THREE_TERM, SKELETON_SUB]),
         2: (SKELETON_THREE_TERM, [SKELETON_IND_NEUT, SKELETON_PURE_MULT]),
-        3: (SKELETON_IND_NEUT, [SKELETON_PURE_MULT]),
-        4: (SKELETON_PURE_MULT, [SKELETON_SUB]),
-        5: (SKELETON_SUB, []),
+        3: (SKELETON_IND_NEUT, [SKELETON_PURE_MULT, SKELETON_SINGLE]),
+        4: (SKELETON_PURE_MULT, [SKELETON_SUB, SKELETON_RESIDUAL]),
+        5: (SKELETON_SUB, [SKELETON_SINGLE]),
+        6: (SKELETON_RESIDUAL, [SKELETON_CROSS_GATE, SKELETON_NONLINEAR_BREAKER]),
     }
     
     primary_sk, secondary_sks = phase_map.get(rotation_phase, phase_map[0])
