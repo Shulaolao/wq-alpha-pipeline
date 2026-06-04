@@ -2215,15 +2215,13 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         all_candidates.extend(pv_cands)
 
     # ── NEW STRUCTURAL GENERATORS ──
-    # v4 SC breakthrough: Only generate from skeletons that have passed IS checks.
-    # DIRECT_RANK: 0% IS pass after 195 attempts → skip entirely
-    # THREE_TERM: 3.8% IS pass, 0% SC pass → skip entirely
-    # MULT_RATIO: 100% SC fail rate → already blocked by sc_fail_rate
-    
-    # PURE_ADD removed: rank(A/B)+rank(C/D) has zero time-series component,
-    # causing WQ to return S=None for every expression (cross-section only → no trading signal).
-    # Use THREE_TERM (which adds a ts_* term) or DIRECT_RANK with ts_* operators instead.
-    
+    # v4: Skeleton strategy based on actual SC results:
+    # - MULT_RATIO (MULT skeleton): 70 IS pass, 4 SC pass — BEST performing
+    # - sub_delta: 251 attempts, 0 IS pass — FIXED by using ts_delta on ratio
+    # - DIRECT_RANK: 0% IS pass — skip
+    # - THREE_TERM: 3.8% IS, 0% SC — skip
+    # - PURE_ADD (rank(A/B)+rank(C/D)): zero ts_* → S=None always — skip
+
     pure_mult = _generate_pure_mult_candidates(ortho, active_exprs)
     if pure_mult and SKELETON_PURE_MULT not in blocked_skeletons:
         log(f"  ✖️ Adding {len(pure_mult)} PURE_MULT candidates")
@@ -2231,15 +2229,6 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     elif pure_mult and SKELETON_PURE_MULT in blocked_skeletons:
         log(f"  ⛔ Pure multiplication blocked (SC fail rate too high), skipping")
         pure_mult = []
-
-    # PURE_ADD removed: rank(A/B)+rank(C/D) has zero time-series component,
-    # causing WQ to return S=None for every expression (cross-section only → no trading signal).
-    # Use THREE_TERM (which adds a ts_* term) or DIRECT_RANK with ts_* operators instead.
-
-    # NOTE: DIRECT_RANK was re-enabled after analysis showed:
-    # - MULT_RATIO (MULT skeleton): 70 IS pass, 4 SC pass — BEST performing skeleton
-    # - 3 SC_PASS alphas are all MULT type
-    # DIRECT_RANK and THREE_TERM can be re-enabled if they show improvement
     ts_std = _generate_ts_std_candidates(ortho, active_exprs)
     if ts_std:
         log(f"  📈 Adding {len(ts_std)} TS_STD candidates (volatility — completely unused skeleton)")
