@@ -75,18 +75,6 @@ DEFAULT_SETTINGS = {
     "startDate": "2019-01-01", "endDate": "2023-12-31", "testPeriod": "P1Y"
 }
 
-# ── New field combos for SC breakthrough (price/volume fields, not fundamentals) ──
-# These fields are NOT heavily used in existing Active Alphas, reducing SC collision.
-NEW_SUB_DELTA_EXPS = [
-    "rank(close) - rank(ts_delta(volume,10))",
-    "rank(vwap/close) - rank(ts_delta(returns,5))",
-    "rank(close/open) - rank(ts_zscore(volume,20))",
-    "rank(close) - 1.0*rank(ts_std(volume,10))",
-    "rank(ts_delta(close,3)) - rank(ts_delta(volume,5))",
-    "rank(log(volume)) - rank(ts_delta(close,5))",
-    "rank(ts_mean(close,5)/close) - rank(ts_delta(volume,10))",
-]
-
 # Lightweight settings for quick test (1 year, faster)
 QUICK_SETTINGS = dict(DEFAULT_SETTINGS)
 QUICK_SETTINGS.update({
@@ -1183,54 +1171,35 @@ def _generate_mult_candidates(ratio_pool: list, ortho: dict, active_exprs: list)
     return candidates
 
 def _generate_sub_candidates(ratio_pool: list, ortho: dict, active_exprs: list) -> list:
-    """Generate subtraction skeleton candidates.
-    
-    CRITICAL FIX: Original version mixed quarterly fundamentals with daily ts_*
-    (e.g. rank(ebitda/cap) - rank(ts_delta(adv20,5))), causing WQ coverage
-    mismatch → S=None for ALL candidates.
-    
-    New strategy: use fundamental growth rates via ts_delta on the RATIO itself.
-    ts_delta(rank(A/B), N) preserves the fundamental frequency and avoids coverage
-    mismatch. Pattern verified working: -1*rank(ts_delta(close,5)) + rank(oi/equity)
-    (E5kZ7p60). We invert: rank(ts_delta(fund_ratio, N)) - rank(ts_delta(daily, M))
-    where both sides are broadcast to daily but the fundamental side dominates.
-    
-    When ratio_pool is empty or all zero-usage, fall back to verified pairs only.
-    """
+    """Generate subtraction skeleton candidates: rank(A/B) - rank(ts_*(C,N))."""
     candidates = []
+    subtractions = [
+        ("ts_delta(close,10)", "delta_close_10"),
+        ("ts_delta(close,20)", "delta_close_20"),
+        ("ts_delta(volume,5)", "delta_vol_5"),
+        ("ts_delta(adv20,5)", "delta_adv_5"),
+        ("ts_delta(returns,5)", "delta_ret_5"),
+        ("ts_std(returns,10)", "std_ret_10"),
+        ("ts_std(adv20,10)", "std_adv_10"),
+        ("ts_zscore(volume,10)", "zsc_vol_10"),
+        ("ts_corr(close,volume,20)", "corr_pv_20"),
+    ]
     seen = set()
-    
-    # Strategy 1: Fundamental growth rate (ts_delta on ratio)
-    # This is the only approach that has proven to avoid S=None for fundamentals
-    for (ratio_str, ratio_name) in ratio_pool[:10]:
-        # Extract fields from ratio for naming
-        parts = ratio_name.split("_")
-        r_name = parts[0] if parts else ratio_name
-        
-        for period in [5, 10, 15]:
-            expr = f"rank(ts_delta({ratio_str}, {period})) - rank(ts_delta(adv20, 5))"
-            if expr not in seen and len(expr) < 200:
-                seen.add(expr)
-                score = score_candidate_orthogonality(expr, ortho, active_exprs)
-                name = f"S_{r_name}_g{period}"[:40]
-                name = name.replace("-","_").replace(" ","")
-                candidates.append({
-                    "name": name, "expr": expr,
-                    "orthogonality_score": score,
-                    "skeleton": SKELETON_SUB,
-                    "weight": 0.5,
-                })
-    
-    # Strategy 2: Pure fundamental ratio pair subtraction (no ts_*)
-    # WARNING: rank(A/B) - rank(C/D) has NO ts_* operator → S=None always.
-    # So we skip this strategy entirely. Only Strategy 1 and 3 are used.
-    
-    # Strategy 3: Cross-gate (sign of fundamental signal * daily signal)
-    # Pattern from working alphas: rank(oi/equity) * rank(ts_mean(adv20,5))
-    # But this is multiplication, not subtraction. For SUB skeleton, use:
-    # sign(ts_delta(fund_ratio, N)) * rank(ts_delta(daily, M)) 
-    # Actually this is cross_gate skeleton, not SUB. Skip for SUB category.
-    
+    for (ratio_str, ratio_name) in ratio_pool[:5]:
+        for sub_str, sub_name in subtractions[:5]:
+            expr = f"{ratio_str} - rank({sub_str})"
+            if expr in seen:
+                continue
+            seen.add(expr)
+            score = score_candidate_orthogonality(expr, ortho, active_exprs)
+            name = f"S_{ratio_name}_{sub_name}"[:40]
+            name = name.replace("-","_").replace(" ","")
+            candidates.append({
+                "name": name, "expr": expr,
+                "orthogonality_score": score,
+                "skeleton": SKELETON_SUB,
+                "weight": 0.5,
+            })
     candidates.sort(key=lambda x: -x["orthogonality_score"])
     return candidates
 
@@ -1283,38 +1252,6 @@ def _generate_fund_growth_sub_candidates(ortho: dict, active_exprs: list) -> lis
             })
     candidates.sort(key=lambda x: -x["orthogonality_score"])
     return candidates
-
-
-def _generate_price_volume_candidates(ortho: dict, active_exprs: list) -> list:
-    """
-    Generate subtraction candidates using ONLY price/volume fields.
-    Strategy: These fields have lower SC collision because active alphas
-    heavily use fundamentals (revenue, debt, equity, etc.) while price/volume
-    combos are underutilized. Pattern: rank(PV_A) - rank(ts_delta/PV_B).
-    These avoid fundamental field overlap → lower SC values.
-    """
-    candidates = []
-    # Price/volume expressions that don't use any fundamental fields
-    pv_expressions = [
-        ("rank(close) - rank(ts_delta(volume,10))", "PV_close_vol10"),
-        ("rank(vwap/close) - rank(ts_delta(returns,5))", "PV_vwap_ret5"),
-        ("rank(close/open) - rank(ts_zscore(volume,20))", "PV_co_zsc_vol20"),
-        ("rank(close) - 1.0*rank(ts_std(volume,10))", "PV_close_std_vol10"),
-        ("rank(ts_delta(close,3)) - rank(ts_delta(volume,5))", "PV_dc3_dv5"),
-        ("rank(log(volume)) - rank(ts_delta(close,5))", "PV_logv_dc5"),
-        ("rank(ts_mean(close,5)/close) - rank(ts_delta(volume,10))", "PV_mc5_dc10"),
-    ]
-    for expr, name in pv_expressions:
-        score = score_candidate_orthogonality(expr, ortho, active_exprs)
-        candidates.append({
-            "name": name, "expr": expr,
-            "orthogonality_score": score,
-            "skeleton": "price_volume",
-            "weight": 1.0,
-        })
-    candidates.sort(key=lambda x: -x["orthogonality_score"])
-    return candidates
-
 
 def _generate_new_ratio_variations(cand: dict, variations: list, ortho: dict, max_attempts: int):
     """Generate tune variations using completely new field pairs.
@@ -1540,207 +1477,112 @@ def _generate_direct_rank_candidates(ortho: dict, active_exprs: list) -> list:
     Direct field rank with at least one time-series operator on every expression.
     Pure cross-section (no ts_*) always returns S=None in WQ.
     
-    KEY FIX (2026-06-04): 186 attempts, 0 IS pass. Root cause:
-    - Pattern 4 (rank(X)+W*rank(returns)): "add" with returns = pure momentum = negative SHARPE
-    - Pattern 3 (ts_rank(fund)): ts_rank on raw fund = noisy, low signal
-    - Pattern 5/6/7 (ts_corr/zscore/ts_rank on pv1): low IS pass rate
-    
-    New strategy: mirror SUB's success pattern exactly:
-    - Subtract, not add: rank(fund) - W*rank(ts_delta(pv1, N))
-    - Use proven fields: debt, equity, operating_income (NOT cap which is size-biased)
-    - Use proven operators: ts_delta(close/high, N) — proven SC-safe in SUB
-    
-    Additionally: add rank(fund) + W*rank(ts_decay_linear(pv1, N)) for
-    mean-reversion momentum (decay_linear penalizes distant outliers).
+    Patterns:
+      - fund + ts_delta(pv1):  rank(fund) - W*rank(ts_delta(close,5))
+      - ts_rank(fund) +/- rank(pv1):  rank(ts_rank(fund,250)) +/- W*rank(pv1)
+      - cross-domain:  rank(fund) - W*rank(returns)  (returns is natively time-series)
     """
     candidates = []
-    fund_fields = ["revenue", "debt", "equity", "operating_income"]
-    pv1_fields = ["close", "high", "low"]
+    # Use fund fields + pv1 fields with time-series wrapping
+    fund_fields = ["revenue", "debt", "operating_income", "cap", "enterprise_value", "equity"]
+    pv1_fields = ["returns", "volume", "adv20", "high", "low", "open", "close", "vwap"]
 
-    # ── Pattern 1: ts_delta on pv1 (SUB-proven formula) ──
-    # This mirrors SUB's 100% SC pass rate
-    for fund in fund_fields:
-        for pv1 in pv1_fields:
-            for window in [5, 7]:
-                expr = f"rank({fund})-{1.0}*rank(ts_delta({pv1},{window}))"
-                name = f"DR_{fund[:4]}_d{pv1[:3]}{window}"[:40]
-                if expr not in active_exprs:
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score_candidate_orthogonality(expr, ortho, active_exprs),
-                        "skeleton": SKELETON_DIRECT_RANK,
-                        "weight": 1.0,
-                    })
-                # Also try weight 0.7
-                expr2 = f"rank({fund})-{0.7}*rank(ts_delta({pv1},{window}))"
-                name2 = f"DR_{fund[:4]}_d{pv1[:3]}{window}_w7"[:40]
-                if expr2 not in active_exprs:
-                    candidates.append({
-                        "name": name2, "expr": expr2,
-                        "orthogonality_score": score_candidate_orthogonality(expr2, ortho, active_exprs),
-                        "skeleton": SKELETON_DIRECT_RANK,
-                        "weight": 0.7,
-                    })
+    # Base combos: (left, right, op, base_weight, suffix, extra_weights)
+    # extra_weights allows generating additional weight variants beyond the base
+    combos = [
+        # ── Pattern 1: ts_delta wrapper on pv1 side (lowest operator count) ──
+        ("debt", "ts_delta(close,5)", "subtract", 1.0, "debt_dcl5", [0.5, 0.7]),
+        ("revenue", "ts_delta(close,5)", "subtract", 1.0, "rev_dcl5", [0.5, 0.7]),
+        ("cap", "ts_delta(close,5)", "subtract", 1.0, "cap_dcl5", [0.5, 0.7]),
+        ("enterprise_value", "ts_delta(close,5)", "subtract", 1.0, "ev_dcl5", [0.5, 0.7]),
+        ("operating_income", "ts_delta(close,5)", "subtract", 1.0, "oi_dcl5", [0.5, 0.7]),
+        ("equity", "ts_delta(close,5)", "subtract", 1.0, "eq_dcl5", [0.5, 0.7]),
 
-    # ── Pattern 2: ts_decay_linear on pv1 (NEW — mean-reversion momentum) ──
-    # decay_linear gives more weight to recent data → captures short-term reversal
-    for fund in fund_fields:
-        for pv1 in pv1_fields:
-            for window in [5, 10]:
-                expr = f"rank({fund})-{1.0}*rank(ts_decay_linear({pv1},{window}))"
-                name = f"DR_{fund[:4]}_dl{pv1[:3]}{window}"[:40]
-                if expr not in active_exprs:
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score_candidate_orthogonality(expr, ortho, active_exprs),
-                        "skeleton": SKELETON_DIRECT_RANK,
-                        "weight": 1.0,
-                    })
+        ("debt", "ts_delta(high,5)", "subtract", 1.0, "debt_dhi5", [0.5, 0.7]),
+        ("revenue", "ts_delta(high,5)", "subtract", 1.0, "rev_dhi5", [0.5, 0.7]),
 
-    # ── Pattern 3: ts_delta(fund, N) +/- rank(pv1) — FUNDamental delta ──
-    # Instead of raw fund rank, use CHANGE in fundamentals
-    # rank(ts_delta(fund, N)) - W*rank(pv1): companies with improving fundamentals
-    for fund in fund_fields:
-        for pv1 in ["close", "returns"]:
-            for window in [5, 10]:
-                expr = f"rank(ts_delta({fund},{window}))-{1.0}*rank({pv1})"
-                name = f"DR_td{fund[:4]}_{pv1}{window}"[:40]
-                if expr not in active_exprs:
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score_candidate_orthogonality(expr, ortho, active_exprs),
-                        "skeleton": SKELETON_DIRECT_RANK,
-                        "weight": 1.0,
-                    })
+        # ── Pattern 2: ts_mean momentum on pv1 side ──
+        ("debt", "ts_mean(returns,5)", "subtract", 1.0, "debt_mret5", [0.5, 0.7]),
+        ("revenue", "ts_mean(returns,5)", "subtract", 1.0, "rev_mret5", [0.5, 0.7]),
+        ("cap", "ts_mean(returns,5)", "subtract", 1.0, "cap_mret5", [0.5, 0.7]),
+        ("equity", "ts_mean(returns,5)", "subtract", 1.0, "eq_mret5", [0.5, 0.7]),
+        ("enterprise_value", "ts_mean(returns,5)", "subtract", 1.0, "ev_mret5", [0.5, 0.7]),
+        ("operating_income", "ts_mean(volume,10)", "subtract", 1.0, "oi_mvol10", [0.5, 0.7]),
 
-    # ── Pattern 4: ts_rank(ts_delta(fund, N), W) — rank the change ──
-    # Double-time-series: ts_delta + ts_rank on same fundamental
-    for fund in fund_fields:
-        for window_d in [5, 10]:
-            for window_r in [20, 60]:
-                expr = f"ts_rank(ts_delta({fund},{window_d}),{window_r})"
-                name = f"DR_trtd{fund[:4]}_d{window_d}_r{window_r}"[:40]
-                if expr not in active_exprs:
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score_candidate_orthogonality(expr, ortho, active_exprs),
-                        "skeleton": SKELETON_DIRECT_RANK,
-                        "weight": 0.0,
-                    })
+        # ── Pattern 3: ts_rank wrapping on fundamental side ──
+        ("ts_rank(debt,250)", "returns", "add", 1.0, "tsr_debt_ret", [0.5, 0.7]),
+        ("ts_rank(revenue,250)", "returns", "add", 1.0, "tsr_rev_ret", [0.5, 0.7]),
+        ("ts_rank(cap,250)", "returns", "add", 1.0, "tsr_cap_ret", [0.5, 0.7]),
+        ("ts_rank(equity,250)", "returns", "subtract", 1.0, "tsr_eq_ret_sub", [0.5, 0.7]),
+        ("ts_rank(enterprise_value,250)", "returns", "subtract", 1.0, "tsr_ev_ret_sub", [0.5, 0.7]),
+        ("ts_rank(operating_income,250)", "volume", "subtract", 1.0, "tsr_oi_vol", [0.5, 0.7]),
 
-    candidates.sort(key=lambda x: -x["orthogonality_score"])
-    return candidates
+        # ── Pattern 4: cross-domain (fund + native-ts pv1, proven working) ──
+        ("debt", "returns", "subtract", 2.0, "debt_ret_sub2", []),
+        ("revenue", "returns", "subtract", 1.0, "rev_ret_sub", [0.3, 0.5, 0.7, 0.9]),
+        ("cap", "returns", "add", 1.0, "cap_ret_add", [0.3, 0.5, 0.7, 0.9]),
+        ("enterprise_value", "returns", "subtract", 1.0, "ev_ret_sub", [0.3, 0.5, 0.7, 0.9]),
+        ("equity", "returns", "subtract", 1.0, "eq_ret_sub", [0.3, 0.5, 0.7, 0.9]),
+        ("operating_income", "returns", "subtract", 1.0, "oi_ret_sub", [0.3, 0.5, 0.7, 0.9]),
 
+        # ── Pattern 5: fund + ts_corr(close, volume, N) — cross-correlation signal ──
+        ("debt", "ts_corr(close,volume,10)", "add", 1.0, "debt_cv10", [0.3, 0.5]),
+        ("revenue", "ts_corr(close,volume,10)", "add", 1.0, "rev_cv10", [0.3, 0.5]),
+        ("enterprise_value", "ts_corr(close,volume,10)", "add", 1.0, "ev_cv10", [0.3, 0.5]),
+        ("operating_income", "ts_corr(close,volume,10)", "add", 1.0, "oi_cv10", [0.3, 0.5]),
 
-def _generate_ts_std_candidates(ortho: dict, active_exprs: list) -> list:
-    """
-    Gap-fill: ts_std — volatility-based signals.
-    rank(ts_std(returns, N)) +/− rank(fund_ratio)
-    ts_std is completely unused in any active alpha → highest novelty bonus.
-    Captures: mean-reversion on volatility (high vol → low returns).
-    """
-    candidates = []
-    fund_ratios = [
-        ("debt/equity", "de"),
-        ("debt/enterprise_value", "de_ev"),
-        ("revenue/enterprise_value", "rev_ev"),
-        ("revenue/cap", "rev_cap"),
-        ("operating_income/cap", "oi_cap"),
+        # ── Pattern 6: fund + ts_zscore(pv1) — zscore momentum ──
+        ("debt", "ts_zscore(close,20)", "add", 1.0, "debt_zs20", [0.3, 0.5, 0.7]),
+        ("revenue", "ts_zscore(close,20)", "add", 1.0, "rev_zs20", [0.3, 0.5, 0.7]),
+        ("enterprise_value", "ts_zscore(close,20)", "add", 1.0, "ev_zs20", [0.3, 0.5, 0.7]),
+        ("equity", "ts_zscore(close,20)", "add", 1.0, "eq_zs20", [0.3, 0.5, 0.7]),
+        ("operating_income", "ts_zscore(close,20)", "add", 1.0, "oi_zs20", [0.3, 0.5, 0.7]),
+
+        # ── Pattern 7: fund + ts_rank(pv1, N) — rank momentum ──
+        ("debt", "ts_rank(close,20)", "subtract", 1.0, "debt_rcl20", [0.3, 0.5]),
+        ("revenue", "ts_rank(close,20)", "subtract", 1.0, "rev_rcl20", [0.3, 0.5]),
+        ("enterprise_value", "ts_rank(close,20)", "subtract", 1.0, "ev_rcl20", [0.3, 0.5]),
+        ("operating_income", "ts_rank(close,20)", "subtract", 1.0, "oi_rcl20", [0.3, 0.5]),
+
+        # ── Pattern 8: ts_mean(returns, 20) — longer momentum window ──
+        ("debt", "ts_mean(returns,20)", "subtract", 1.0, "debt_mret20", [0.3, 0.5, 0.7]),
+        ("revenue", "ts_mean(returns,20)", "subtract", 1.0, "rev_mret20", [0.3, 0.5, 0.7]),
+        ("enterprise_value", "ts_mean(returns,20)", "subtract", 1.0, "ev_mret20", [0.3, 0.5, 0.7]),
+        ("operating_income", "ts_mean(returns,20)", "subtract", 1.0, "oi_mret20", [0.3, 0.5, 0.7]),
+        ("equity", "ts_mean(returns,20)", "subtract", 1.0, "eq_mret20", [0.3, 0.5, 0.7]),
+
+        # ── Pattern 9: ts_mean(volume, 20) — volume momentum ──
+        ("debt", "ts_mean(volume,20)", "subtract", 1.0, "debt_mvol20", [0.3, 0.5, 0.7]),
+        ("revenue", "ts_mean(volume,20)", "subtract", 1.0, "rev_mvol20", [0.3, 0.5, 0.7]),
+        ("enterprise_value", "ts_mean(volume,20)", "subtract", 1.0, "ev_mvol20", [0.3, 0.5, 0.7]),
+        ("operating_income", "ts_mean(volume,20)", "subtract", 1.0, "oi_mvol20", [0.3, 0.5, 0.7]),
     ]
-    # ts_std windows: short (5), medium (10), long (20)
-    std_windows = [5, 10, 20]
+
     seen = set()
-    for w in [0.5, 0.7, 1.0]:
-        for window in std_windows:
-            for (ratio_str, ratio_name) in fund_ratios:
-                for op_sign in ["add", "subtract"]:
-                    if op_sign == "add":
-                        expr = f"rank(ts_std(returns,{window}))+{w}*rank({ratio_str})"
-                    else:
-                        expr = f"rank(ts_std(returns,{window}))-{w}*rank({ratio_str})"
-                    if expr in seen or expr in active_exprs:
-                        continue
-                    seen.add(expr)
-                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
-                    name = f"TS_std_{ratio_name}_w{int(w*10)}_d{window}"[:40]
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score,
-                        "skeleton": SKELETON_TSRANK_CORR,  # classify as TS_RANK_CORR group for rotation
-                        "weight": w,
-                    })
-    candidates.sort(key=lambda x: -x["orthogonality_score"])
-    return candidates
-
-
-def _generate_volatility_decay_candidates(ortho: dict, active_exprs: list) -> list:
-    """
-    Gap-fill: volatility_decay — decay-linear momentum on price/vwap ratios.
-    rank(ts_decay_linear(close/vwap, N)) +/− rank(fund)
-    decay_linear is only used in 1 active (negatively).
-    Captures: momentum mean-reversion using decay-weighted price vs VWAP.
-    """
-    candidates = []
-    fund_fields = ["debt", "revenue", "operating_income", "cap", "equity"]
-    # decay windows: 5, 10, 20
-    decay_windows = [5, 10, 20]
-    seen = set()
-    for w in [0.5, 0.7, 1.0]:
-        for window in decay_windows:
-            for fund in fund_fields:
-                for op_sign in ["add", "subtract"]:
-                    if op_sign == "add":
-                        expr = f"rank(ts_decay_linear(close/vwap,{window}))+{w}*rank({fund})"
-                    else:
-                        expr = f"rank(ts_decay_linear(close/vwap,{window}))-{w}*rank({fund})"
-                    if expr in seen or expr in active_exprs:
-                        continue
-                    seen.add(expr)
-                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
-                    name = f"VL_decay_{fund}_w{int(w*10)}_d{window}"[:40]
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score,
-                        "skeleton": SKELETON_TREND_BREAK,
-                        "weight": w,
-                    })
-    candidates.sort(key=lambda x: -x["orthogonality_score"])
-    return candidates
-
-
-def _generate_zscore_momentum_candidates(ortho: dict, active_exprs: list) -> list:
-    """
-    Gap-fill: zscore_momentum — positive zscore signals.
-    rank(ts_zscore(pv1, N)) + rank(fund_ratio)
-    Current active has ts_zscore but only with negative sign (−rank(ts_zscore)).
-    Captures: zscore deviation → fundamental quality (zscore high → good fundamentals).
-    """
-    candidates = []
-    fund_ratios = [
-        ("debt/equity", "de"),
-        ("debt/enterprise_value", "de_ev"),
-        ("revenue/enterprise_value", "rev_ev"),
-        ("revenue/cap", "rev_cap"),
-    ]
-    zscore_fields = ["close", "volume", "high"]
-    zscore_windows = [10, 20, 30]
-    seen = set()
-    for w in [0.3, 0.5, 0.7, 1.0]:
-        for field in zscore_fields:
-            for window in zscore_windows:
-                for (ratio_str, ratio_name) in fund_ratios:
-                    expr = f"rank(ts_zscore({field},{window}))+{w}*rank({ratio_str})"
-                    if expr in seen or expr in active_exprs:
-                        continue
-                    seen.add(expr)
-                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
-                    name = f"ZS_{field}{window}_{ratio_name}_w{int(w*10)}"[:40]
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score,
-                        "skeleton": SKELETON_TSRANK_CORR,
-                        "weight": w,
-                    })
+    for left, right, op, base_w, suffix, extra_ws in combos:
+        # Always generate base weight variant
+        weights_to_try = [base_w]
+        # Also generate extra weight variants (different S/F combos)
+        for ew in extra_ws:
+            if ew != base_w:
+                weights_to_try.append(ew)
+        
+        for w in weights_to_try:
+            if op == "add":
+                expr = f"rank({left})+{w}*rank({right})"
+            else:
+                expr = f"rank({left})-{w}*rank({right})"
+            if expr in seen or expr in active_exprs:
+                continue
+            seen.add(expr)
+            score = score_candidate_orthogonality(expr, ortho, active_exprs)
+            name = f"DR_{suffix}_w{int(w*10)}"[:40]
+            candidates.append({
+                "name": name, "expr": expr,
+                "orthogonality_score": score,
+                "skeleton": SKELETON_DIRECT_RANK,
+                "weight": w,
+            })
     candidates.sort(key=lambda x: -x["orthogonality_score"])
     return candidates
 
@@ -1750,37 +1592,28 @@ def _generate_three_term_candidates(ortho: dict, active_exprs: list) -> list:
     gap_fill: three_term — rank(A/B) + rank(C/D) - rank(ts_*(X,N))
     Three terms: two fundamental ratios plus a reversal/momentum signal.
     Captures: fundamental value + fundamental quality - price trend.
-    
-    KEY FIX (2026-06-04): 185 attempts, 7 IS pass (3.8%), 0 SC pass.
-    Root cause: TWO FUND RATIOS create high self-correlation with MULT alphas
-    (all active alphas use rev/ev, oi/equity, de ratios). 
-    
-    Strategy:
-    1. Use CROSS-GENRE ratio pairs (fund ratio + pv1 rank) instead of two fund ratios
-       This creates structural distance from active MULT alphas → lower SC
-    2. Use ts_delta (not ts_mean) on momentum side — proven SC-safe
-    3. Keep weights low (0.3-0.5) to minimize self-correlation from the third term
     """
     candidates = []
-    
-    # ── Pattern 1: 2 fund ratios - ts_delta(pv1) (original proven IS pattern) ──
-    # Keep a SMALL set of these with low weights
     fund_ratios = [
         ("revenue/enterprise_value", "rev_ev"),
-        ("operating_income/cap", "oi_cap"),
         ("debt/equity", "de"),
+        ("revenue/cap", "rev_cap"),
+        ("operating_income/cap", "oi_cap"),
+        ("debt/enterprise_value", "de_ev"),
     ]
     pv1_signals = [
         ("ts_delta(close,5)", "dcl5"),
-        ("ts_delta(high,7)", "dhi7"),
+        ("ts_mean(returns,5)", "mret5"),
+        ("ts_zscore(volume,10)", "zvol10"),
+        ("ts_corr(close,volume,15)", "cpv15"),
     ]
     seen = set()
-    for (r1_str, r1_name) in fund_ratios:
-        for (r2_str, r2_name) in fund_ratios:
+    for (r1_str, r1_name) in fund_ratios[:4]:
+        for (r2_str, r2_name) in fund_ratios[:4]:
             if r1_str == r2_str:
                 continue
             for (sig_str, sig_name) in pv1_signals:
-                for w in [0.3, 0.5]:  # LOWER weights → less self-correlation
+                for w in [0.5, 0.7]:
                     expr = f"rank({r1_str})+rank({r2_str})-{w}*rank({sig_str})"
                     if expr in seen or expr in active_exprs:
                         continue
@@ -1790,58 +1623,10 @@ def _generate_three_term_candidates(ortho: dict, active_exprs: list) -> list:
                     name = name.replace("-","_").replace(" ","")
                     candidates.append({
                         "name": name, "expr": expr,
-                        "orthogonality_score": score,
+                        "orthogonality_score": score,  # P2
                         "skeleton": SKELETON_THREE_TERM,
                         "weight": w,
                     })
-
-    # ── Pattern 2: cross-genre (fund ratio + single fund rank) - ts_delta(pv1) ──
-    # Instead of two ratios, use one ratio + one raw fund field
-    # This breaks the pattern-matching against active MULT alphas
-    fund_single = ["debt", "equity", "operating_income", "revenue"]
-    for (ratio_str, ratio_name) in fund_ratios:
-        for fund in fund_single:
-            if ratio_str.endswith(f"/{fund}") or ratio_str.startswith(f"{fund}/"):
-                continue  # avoid overlap
-            for (sig_str, sig_name) in pv1_signals:
-                for w in [0.3, 0.5]:
-                    expr = f"rank({ratio_str})+rank({fund})-{w}*rank({sig_str})"
-                    if expr in seen or expr in active_exprs:
-                        continue
-                    seen.add(expr)
-                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
-                    name = f"3T_{ratio_name}_{fund[:3]}_{sig_name}_w{int(w*10)}"[:40]
-                    name = name.replace("-","_").replace(" ","")
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score,
-                        "skeleton": SKELETON_THREE_TERM,
-                        "weight": w,
-                    })
-
-    # ── Pattern 3: 3 fund fields (no ratios) - ts_mean(pv1) ──
-    # rank(fund1) + rank(fund2) + rank(fund3) - rank(ts_mean(pv1,N))
-    # All different fields → minimal self-correlation
-    for f1 in ["debt", "equity", "operating_income"]:
-        for f2 in ["revenue", "cap"]:
-            if f1 == f2:
-                continue
-            for f3 in ["enterprise_value"]:
-                for w in [0.3, 0.5]:
-                    expr = f"rank({f1})+rank({f2})-{w}*rank(ts_mean(close,5))"
-                    if expr in seen or expr in active_exprs:
-                        continue
-                    seen.add(expr)
-                    score = score_candidate_orthogonality(expr, ortho, active_exprs)
-                    name = f"3T_{f1[:3]}{f2[:3]}_{f3[:3]}_mcl5_w{int(w*10)}"[:40]
-                    name = name.replace("-","_").replace(" ","")
-                    candidates.append({
-                        "name": name, "expr": expr,
-                        "orthogonality_score": score,
-                        "skeleton": SKELETON_THREE_TERM,
-                        "weight": w,
-                    })
-
     candidates.sort(key=lambda x: -x["orthogonality_score"])
     return candidates
 
@@ -2128,8 +1913,7 @@ def _generate_cross_gate_candidates(ortho: dict, active_exprs: list) -> list:
 
 
 def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
-                        failed_exprs: list = None, stuck_batches: int = 0,
-                        skeleton_popularity: dict = None) -> list:
+                        failed_exprs: list = None, stuck_batches: int = 0) -> list:
     """
     v3: AST-aware candidate generation with time-frequency filtering.
     
@@ -2143,31 +1927,13 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     Never mixes pv1 and fundamental fields in the same ratio pair.
     Never reuses exact field pairs from active alphas.
     Never regenerates expressions that are in failed_exprs list.
-    NEW: Skip skeleton types with SC fail_rate >= 90% to avoid waste.
     """
-    ratio_pool = _build_ratio_pool(ortho, skip_zero_occupancy=(stuck_batches >= 1))
-    
-    # ── Skeleton filter: skip skeleton types that have SC fail_rate >= 90% ──
-    # This prevents wasting time on skeleton types that consistently fail SC checks
-    blocked_skeletons = set()
-    if skeleton_popularity:
-        for sk, data in skeleton_popularity.items():
-            attempts = data.get("attempts", 0)
-            sc_pass = data.get("sc_pass", 0)
-            sc_fail = data.get("sc_fail", 0)
-            sc_total = sc_pass + sc_fail
-            if sc_total >= 2:  # At least 2 SC attempts
-                fail_rate = sc_fail / max(sc_total, 1)
-                if fail_rate >= 0.9:
-                    blocked_skeletons.add(sk)
-                    log(f"  ⛔ Skeleton '{sk}' blocked (SC fail rate: {fail_rate:.0%}, attempts={attempts})")
+    ratio_pool = _build_ratio_pool(ortho, skip_zero_occupancy=(stuck_batches >= 2))
     
     mult_count = ortho.get("multiplication_count", 0)
     sub_count = ortho.get("subtraction_count", 0)
     
     log(f"  🏗 AST structure balance: {mult_count} mult / {sub_count} sub in active")
-    if blocked_skeletons:
-        log(f"  🚫 Blocked skeleton types: {blocked_skeletons}")
     
     all_candidates = []
     
@@ -2176,12 +1942,9 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         use_mult = mult_count < 2  # Prefer multiplication if < 2 exist
         use_sub = not use_mult and sub_count < 6  # Fall back to subtraction
         
-        if use_mult and SKELETON_MULT not in blocked_skeletons:
+        if use_mult:
             log("  🟢 Generating MULTIPLICATION candidates (skeleton under-utilized)")
             all_candidates = _generate_mult_candidates(ratio_pool, ortho, active_exprs)
-        elif use_mult and SKELETON_MULT in blocked_skeletons:
-            log("  ⚠️ MULTIPLICATION skeleton blocked (SC fail rate too high), falling back to SUB")
-            use_sub = True
         
         if use_sub:
             log("  🔵 Generating SUBTRACTION candidates (multiplication saturated)")
@@ -2198,62 +1961,32 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     
     # Also add multiplication candidates from verified fund ratios
     growth_mul = _generate_fund_growth_mul_candidates(ortho, active_exprs)
-    if growth_mul and SKELETON_MULT not in blocked_skeletons:
+    if growth_mul:
         log(f"  ✖️ Adding {len(growth_mul)} multiplication candidates (preferred over sub)")
         all_candidates.extend(growth_mul)
-    elif growth_mul and SKELETON_MULT in blocked_skeletons:
-        log(f"  ⛔ Growth multiplication blocked (SC fail rate too high), skipping")
-        growth_mul = []
-
-    # ── PRICE/VOLUME GENERATOR: SC breakthrough attempt ──
-    # Pure price/volume expressions avoid fundamental field overlap → lower SC values
-    pv_cands = _generate_price_volume_candidates(ortho, active_exprs)
-    if pv_cands:
-        log(f"  📊 Adding {len(pv_cands)} price/volume candidates (SC breakthrough)")
-        for pc in pv_cands:
-            log(f"    PV: {pc['expr'][:70]}")
-        all_candidates.extend(pv_cands)
 
     # ── NEW STRUCTURAL GENERATORS ──
-    # v4 SC breakthrough: Only generate from skeletons that have passed IS checks.
-    # DIRECT_RANK: 0% IS pass after 195 attempts → skip entirely
-    # THREE_TERM: 3.8% IS pass, 0% SC pass → skip entirely
-    # MULT_RATIO: 100% SC fail rate → already blocked by sc_fail_rate
-    
+    # These fill structural gaps in the current portfolio (see gap_fill docs above)
+    # Each uses only proven field pairs, avoiding S=None (ebitda/cash/sales)
+
     # PURE_ADD removed: rank(A/B)+rank(C/D) has zero time-series component,
     # causing WQ to return S=None for every expression (cross-section only → no trading signal).
     # Use THREE_TERM (which adds a ts_* term) or DIRECT_RANK with ts_* operators instead.
-    
+
     pure_mult = _generate_pure_mult_candidates(ortho, active_exprs)
-    if pure_mult and SKELETON_PURE_MULT not in blocked_skeletons:
+    if pure_mult:
         log(f"  ✖️ Adding {len(pure_mult)} PURE_MULT candidates")
         all_candidates.extend(pure_mult)
-    elif pure_mult and SKELETON_PURE_MULT in blocked_skeletons:
-        log(f"  ⛔ Pure multiplication blocked (SC fail rate too high), skipping")
-        pure_mult = []
 
-    # PURE_ADD removed: rank(A/B)+rank(C/D) has zero time-series component,
-    # causing WQ to return S=None for every expression (cross-section only → no trading signal).
-    # Use THREE_TERM (which adds a ts_* term) or DIRECT_RANK with ts_* operators instead.
+    direct_rank = _generate_direct_rank_candidates(ortho, active_exprs)
+    if direct_rank:
+        log(f"  📊 Adding {len(direct_rank)} DIRECT_RANK candidates (all with ts component)")
+        all_candidates.extend(direct_rank)
 
-    # NOTE: DIRECT_RANK was re-enabled after analysis showed:
-    # - MULT_RATIO (MULT skeleton): 70 IS pass, 4 SC pass — BEST performing skeleton
-    # - 3 SC_PASS alphas are all MULT type
-    # DIRECT_RANK and THREE_TERM can be re-enabled if they show improvement
-    ts_std = _generate_ts_std_candidates(ortho, active_exprs)
-    if ts_std:
-        log(f"  📈 Adding {len(ts_std)} TS_STD candidates (volatility — completely unused skeleton)")
-        all_candidates.extend(ts_std)
-
-    vol_decay = _generate_volatility_decay_candidates(ortho, active_exprs)
-    if vol_decay:
-        log(f"  🌊 Adding {len(vol_decay)} VOL_DECAY candidates (decay-linear momentum)")
-        all_candidates.extend(vol_decay)
-
-    zscore_mom = _generate_zscore_momentum_candidates(ortho, active_exprs)
-    if zscore_mom:
-        log(f"  📊 Adding {len(zscore_mom)} ZSCORE_MOM candidates (positive zscore)")
-        all_candidates.extend(zscore_mom)
+    three_term = _generate_three_term_candidates(ortho, active_exprs)
+    if three_term:
+        log(f"  🔢 Adding {len(three_term)} THREE_TERM candidates")
+        all_candidates.extend(three_term)
 
     ind_neut = _generate_ind_neut_candidates(ortho, active_exprs)
     if ind_neut:
@@ -2383,49 +2116,26 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         else:
             return 0.0  # Too similar to existing expressions
 
-    # ── P8: Over-generation penalty (forces exploration of new skeletons) ──
+    # ── Enhanced composite score ──
     for c in deduped:
         base_score = c.get("orthogonality_score", 0)
         # Apply P1: skeleton failure rate penalty
         sk = c.get("skeleton", "unknown")
         fail_count = skeleton_stats.get(sk, 0)
         if fail_count > 5:
-            base_score -= 1.5
+            base_score -= 1.5  # Heavy penalty on failed skeletons
         elif fail_count > 2:
             base_score -= 0.5
-        # Apply P1b: SC-aware skeleton bonus/penalty from skeleton_popularity
-        if sk in skeleton_popularity:
-            sk_data = skeleton_popularity[sk]
-            sc_pass_rate = sk_data.get("sc_pass_rate", 0.0)
-            if sc_pass_rate == 0.0 and sk_data.get("attempts", 0) >= 2:
-                base_score -= 3.0
-            elif sc_pass_rate > 0.0:
-                base_score += sc_pass_rate * 2.0
         # Apply P6: temporal decay penalty
         decay = _decay_score(c)
         base_score -= decay
         # Apply P7: topological distance bonus
         topo = _topo_distance_score(c)
         base_score += topo
-        # ── P8: Over-generation penalty ──
-        if sk in skeleton_popularity:
-            sk_data = skeleton_popularity[sk]
-            total_attempts = sk_data.get("attempts", 0)
-            if total_attempts >= 10:
-                over_attempts = max(0, total_attempts - 10)
-                over_penalty = -(over_attempts // 10) * 2.0
-                base_score += over_penalty
-                log(f"  📊 [{sk}] {total_attempts} total attempts → over-gen penalty: {over_penalty:.1f}")
         # Update the composite score
         c["composite_score"] = round(base_score, 2)
         c["decay_penalty"] = decay
         c["topo_bonus"] = topo
-        
-        # ── Extra penalty for blocked skeletons (SC fail rate >= 90%) ──
-        # This ensures blocked skeletons never get selected
-        if sk in blocked_skeletons:
-            c["composite_score"] = -999.0  # Effectively infinite penalty
-            c["blocked"] = True
 
     def _sort_key(c):
         return -c.get("composite_score", c.get("orthogonality_score", 0))
@@ -2511,66 +2221,113 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
     total_failed = sum(failed_skeleton_counts.values())
     
     # Adaptive rotation: shift phase if any skeleton dominates the failed pool
-    rotation_phase = stuck_batches % 4  # 0-3 for 4 skeleton groups (SUB/MULT only)
+    rotation_phase = stuck_batches % 7  # 0-6 for 7 skeleton groups
+    rotation_override = False
+    
+    # Check for dominance and force rotation
+    for sk, cnt in failed_skeleton_counts.items():
+        if cnt > total_failed * 2 // 3 and total_failed >= 3:
+            # This skeleton is overused → skip to the next unexplored group
+            # Map ALL skeleton types to rotation phases for dominance override
+            phase_map = {
+                SKELETON_MULT: 0,
+                SKELETON_DIRECT_RANK: 1,
+                SKELETON_THREE_TERM: 2,
+                SKELETON_IND_NEUT: 3,
+                SKELETON_PURE_MULT: 4,
+                SKELETON_SUB: 5,
+                SKELETON_CROSS_GATE: 0,    # cross_gate treated as mult exploration
+                SKELETON_SIGN_SWITCH: 1,   # sign_switch → direct_rank
+                SKELETON_NONLINEAR_BREAKER: 2,
+                SKELETON_TSRANK_CORR: 2,
+                SKELETON_TREND_BREAK: 2,
+                SKELETON_VOL_ADJ: 3,
+                SKELETON_DEEP_CASCADE: 3,
+                SKELETON_RESIDUAL: 4,
+                SKELETON_SINGLE: 5,
+                "other": 6,
+            }
+            current_sk_phase = phase_map.get(sk, 6)
+            rotation_phase = (current_sk_phase + 1) % 6
+            rotation_override = True
+            log(f"  🔄 Skeleton dominance: {sk}={cnt}/{total_failed} → rotate to phase {rotation_phase}")
+            break
+    
+    log(f"  🔄 Rotation phase: {rotation_phase} (stuck_batches={stuck_batches}, override={rotation_override})")
     
     # ── v3.19 Selection with Intra-Batch Diversity (P5) ──
     # Instead of taking n consecutive candidates from one skeleton group,
     # use a round-robin approach across skeleton types to ensure diversity.
     
     # Phase mapping: each phase has a primary skeleton + secondary skeletons.
-    # v4 SC breakthrough: SUB is primary (proven IS pass + only SC-passing skeleton).
-    # DIRECT_RANK (0% IS, 195 attempts) and THREE_TERM (3.8% IS, 0% SC) are removed.
-    # MULT_RATIO is blocked by SC fail rate. Focus on SUB/MULT for SC breakthrough.
-    # 4 phases for 4 proven skeleton groups.
+    # Phase mapping includes all active generators (CROSS_GATE, SIGN_SWITCH, VOL_ADJ, DEEP_CASCADE enabled in v4).
+    # 7 phases (0-6) for 7-group rotation; phase 6 = fallback to residual/deep exploration.
     phase_map = {
-        0: (SKELETON_SUB, [SKELETON_MULT]),
-        1: (SKELETON_MULT, [SKELETON_SUB]),
-        2: (SKELETON_SUB, [SKELETON_MULT]),
-        3: (SKELETON_MULT, [SKELETON_SUB]),
+        0: (SKELETON_MULT, [SKELETON_DIRECT_RANK, SKELETON_THREE_TERM]),
+        1: (SKELETON_DIRECT_RANK, [SKELETON_THREE_TERM, SKELETON_SUB]),
+        2: (SKELETON_THREE_TERM, [SKELETON_IND_NEUT, SKELETON_PURE_MULT]),
+        3: (SKELETON_IND_NEUT, [SKELETON_PURE_MULT, SKELETON_SINGLE]),
+        4: (SKELETON_PURE_MULT, [SKELETON_SUB, SKELETON_RESIDUAL]),
+        5: (SKELETON_SUB, [SKELETON_SINGLE]),
+        6: (SKELETON_RESIDUAL, [SKELETON_CROSS_GATE, SKELETON_NONLINEAR_BREAKER]),
     }
     
-    # ── v3.19 Selection — SUB/MULT only (v4 SC breakthrough) ──
-    # Simplified selection: rotate between SUB and MULT phases.
-    # All other skeleton types are deprecated (0% IS pass or 100% SC fail).
-    
-    # Build groups for SUB and MULT only
-    sub_group = sorted_group(SKELETON_SUB)
-    mult_group = sorted_group(SKELETON_MULT)
-    pure_mult_group = sorted_group(SKELETON_PURE_MULT)
-    cross_group = sorted_group(SKELETON_CROSS_GATE)
-    
-    primary_group = []
-    secondary_groups = []
-    
-    if rotation_phase in (0, 2):
-        primary_group = sub_group
-        secondary_groups = [mult_group, pure_mult_group]
-    else:  # phases 1, 3
-        primary_group = mult_group if mult_group else sub_group
-        secondary_groups = [sub_group, pure_mult_group]
+    primary_sk, secondary_sks = phase_map.get(rotation_phase, phase_map[0])
     
     result = []
     seen_skeletons_in_batch = set()
     
-    # Select from primary group
-    for c in primary_group[:n]:
-        if c not in result and len(result) < n:
-            result.append(c)
-            sk = c.get("skeleton", "unknown")
-            seen_skeletons_in_batch.add(sk)
+    # Round-robin selection: pick one from primary, then secondary, cycling for diversity
+    def pick_next(skeleton_type, min_count=1):
+        """Pick one candidate from a skeleton group, skipping ones already in batch."""
+        group = sorted_group(skeleton_type)
+        for c in group:
+            if c not in result:
+                result.append(c)
+                seen_skeletons_in_batch.add(skeleton_type)
     
-    # Fill remaining from secondary groups
-    for sg in secondary_groups:
-        for c in sg:
+    # Phase 0/4: primary exploration
+    if (rotation_phase in (0, 4)) and sorted_group(primary_sk):
+        # MULT exhaustion check for phase 0
+        if rotation_phase == 0 and mult_exhausted:
+            pass  # skip primary, go to secondary
+        else:
+            # Pick up to n//2 from primary
+            group = sorted_group(primary_sk)
+            for c in group[:n//2]:
+                if c not in result and len(result) < n:
+                    result.append(c)
+                    seen_skeletons_in_batch.add(primary_sk)
+    
+    # Phase 1/5: DIRECT_RANK or SUB primary
+    if rotation_phase in (1, 5):
+        group = sorted_group(primary_sk)
+        for c in group[:n//2]:
             if c not in result and len(result) < n:
                 result.append(c)
-                sk = c.get("skeleton", "unknown")
+                seen_skeletons_in_batch.add(primary_sk)
+    
+    # Phase 2/3: THREE_TERM or IND_NEUT primary
+    if rotation_phase in (2, 3):
+        group = sorted_group(primary_sk)
+        for c in group[:n//2]:
+            if c not in result and len(result) < n:
+                result.append(c)
+                seen_skeletons_in_batch.add(primary_sk)
+    
+    # Fill remaining slots from secondary skeleton groups
+    for sk in secondary_sks:
+        group = sorted_group(sk)
+        for c in group:
+            if c not in result and len(result) < n:
+                result.append(c)
                 seen_skeletons_in_batch.add(sk)
     
-    # Fallback: any remaining groups
-    for c in deduped:
-        if c not in result and len(result) < n:
-            result.append(c)
+    # Final fallback: top candidates from any remaining groups
+    if len(result) < n:
+        for c in deduped:
+            if c not in result and len(result) < n:
+                result.append(c)
     
     result = result[:n]
     
@@ -3227,25 +2984,11 @@ class Workflow:
             # 2.5. Apply skeleton popularity decay (P1)
             self._apply_skeleton_decay()
             
-            # 2.6. Pre-batch: Process IS_PASS alphas pending SC (critical fix)
-            # These alphas were IS_PASS but never reached SC due to pipeline bugs
-            # (before v3.10 fix or due to S=None dead loop consuming all capacity)
-            pending_sc = self._process_pending_is_pass()
-            if pending_sc:
-                log(f"  🔧 Processed {len(pending_sc)} IS_PASS alpha(s) pending SC")
-                # If we processed pending SC alphas, continue to next outer loop iteration
-                # to re-do orthogonality with any new results
-                if pending_sc > 0:
-                    self.state["phase"] = "generate"
-                    self.save_checkpoint()
-                    continue
-            
             # 3. Generate candidates
             candidates = generate_candidates(
                 ortho, [a["expr"] for a in actives], n=3,
                 failed_exprs=self.state.get("failed_expressions", []),
                 stuck_batches=self.state.get("stuck_batches", 0),
-                skeleton_popularity=self.state.get("skeleton_popularity", {}),
             )
             if not candidates:
                 log("❌ No candidates generated — platform may need new data sources", "error")
@@ -3388,17 +3131,8 @@ class Workflow:
                         self._track_skeleton_outcome(cand, "sc_fail", cand.get("sharpe"), cand.get("sc_value"))
                         self.state["batch_progress"] = idx + 1
                         self.save_checkpoint()
-                        notify(f"SC耗尽 ✖️ {cand['name']}\\nSC={cand.get('sc_value','?')}，换字段调参后仍失败",
+                        notify(f"SC耗尽 ✖️ {cand['name']}\nSC={cand.get('sc_value','?')}，换字段调参后仍失败",
                                emoji="⚠️", dedup_key=f"sc_fail_{cand.get('alpha_id','')}")
-                        
-                        # ── DELETE SC-failed alpha from WQ to free resources ──
-                        alpha_id = cand.get("alpha_id")
-                        if alpha_id:
-                            try:
-                                log(f"  🗑️  Deleting SC-failed alpha {alpha_id} ({cand.get('name')})")
-                                self.s.delete(f"{API}/alphas/{alpha_id}", timeout=15)
-                            except Exception as e:
-                                log(f"  ⚠️  Delete failed: {e}")
                         continue
 
                 # ── 4d. IS OPTIMIZATION (post-SC-pass tune) ──
@@ -3553,97 +3287,6 @@ class Workflow:
         log(f"⏩ Quick test: S={sharpe:.2f} >= 1.0, proceeding to full sim")
         return True
 
-    def _process_pending_is_pass(self) -> int:
-        """Process IS_PASS alphas from alpha_stats that haven't been SC-tested.
-        
-        These are alphas that passed IS but were never submitted to SC due to:
-        1. Pipeline bugs before v3.10 (tune-first-lost-alpha)
-        2. S=None dead loop consuming all batch capacity after v3.10
-        
-        Returns: number of alphas processed (SC attempted)
-        """
-        try:
-            # Query for IS_PASS alphas without SC result
-            query = """
-                SELECT alpha_id, name, expr, sharpe, fitness 
-                FROM alpha_stats 
-                WHERE is_status='PASS' AND sc_value IS NULL
-                ORDER BY sharpe DESC
-            """
-            rows = _wqdb.execute_query(query)
-            if not rows:
-                log("  ℹ️ No IS_PASS alphas pending SC")
-                return 0
-            
-            count = 0
-            for row in rows:
-                alpha_id, name, expr, sharpe, fitness = row
-                if not self.running:
-                    break
-                
-                log(f"  🔧 Processing pending IS_PASS: {name} (S={sharpe}, F={fitness})")
-                
-                cand = {
-                    "name": name,
-                    "expr": expr,
-                    "alpha_id": alpha_id,
-                    "sharpe": sharpe,
-                    "fitness": fitness,
-                    "is_status": "PASS",
-                }
-                
-                # Record event
-                _wqdb.record_alpha_event(
-                    name=name, expr=expr,
-                    event_type="is_pass",
-                    sharpe=sharpe,
-                    fitness=fitness,
-                    phase="full_sim"
-                )
-                
-                # Track skeleton outcome
-                self._track_skeleton_outcome(cand, "is_pass", sharpe)
-                
-                # Submit to SC
-                self.state["phase"] = "sc_submit"
-                self.save_checkpoint()
-                
-                log(f"    ⏳ Submitting to SC queue for {name}...")
-                success = self._run_sc(cand)
-                count += 1
-                
-                if not success:
-                    log(f"    ❌ {name}: SC failed ({cand.get('sc_value', '?')})")
-                    log(f"    Trying SC tune...")
-                    success = self._tune_and_retry(cand, {}, "sc")
-                    if not success:
-                        log(f"    ✖️ {name}: all SC variations failed")
-                        _wqdb.record_alpha_event(
-                            name=name, expr=expr,
-                            event_type="sc_fail",
-                            sharpe=sharpe,
-                            sc_value=cand.get("sc_value"),
-                            is_status="SC_FAIL",
-                            phase="sc_submit",
-                            notes="All SC variations failed"
-                        )
-                        self._track_skeleton_outcome(cand, "sc_fail", sharpe, cand.get("sc_value"))
-                else:
-                    # SC passed — track and submit to ACTIVE
-                    self._track_skeleton_outcome(cand, "sc_pass", sharpe, cand.get("sc_value"))
-                    self.state["phase"] = "submit"
-                    self.save_checkpoint()
-                    self._submit_alpha(cand, alpha_id)
-            
-            if count > 0:
-                log(f"  ✅ Processed {count} pending IS_PASS alpha(s) for SC")
-            
-            return count
-            
-        except Exception as e:
-            log(f"  ⚠️ Error processing pending IS_PASS alphas: {e}", "error")
-            return 0
-
     def _run_full_sim(self, cand: dict) -> bool:
         """Create full sim → adaptive IS poll"""
         payload = {"type": "REGULAR", "regular": cand["expr"], "settings": DEFAULT_SETTINGS}
@@ -3770,29 +3413,27 @@ class Workflow:
         return is_pass or soft_pass
     
     def _run_sc(self, cand: dict) -> bool:
-        """Submit SC → get immediate result. WQ returns SC check in 403 response."""
+        """Submit SC → adaptive SC poll"""
         alpha_id = cand.get("alpha_id")
         if not alpha_id:
             return False
         
         log(f"📬 Submitting SC for {alpha_id}...")
         
-        # POST /alphas/{id}/submit with body → WQ returns SC check result immediately in 403
-        # This is KEY: the 403 response contains the SC value!
+        # ── Pre-batch health probe (Directive 3) ──
+        # Skip probe on re-submissions (tune retries) — only probe on first SC attempt
+        if cand.get("_sc_attempt", 1) == 1:
+            probe = self.probe_wq_queue_health()
+            congestion = probe.get("congestion", "moderate")
+            delay = probe.get("recommended_delay_sec", 120)
+            if delay > 0:
+                log(f"⏸️ SC queue {congestion}, delaying {delay}s before submit", "warn")
+                time.sleep(delay)
+            else:
+                log(f"✅ SC queue healthy, proceeding immediately")
+        
         try:
-            r = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={
-                "universe": "TOP3000",
-                "region": "GLOBAL",
-                "delay": 0,
-                "decay": 0,
-                "neutralization": "INDUSTRIAL",
-                "truncation": 0.1,
-                "pasteurization": True,
-                "unitHandling": "VERIFY",
-                "nanHandling": "OFF",
-                "language": "PINVOKE",
-                "visualization": "STAIRS"
-            }, timeout=30)
+            r = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
         except Exception as e:
             log(f"❌ SC submit: {e}", "error")
             return False
@@ -3803,95 +3444,129 @@ class Workflow:
             self.s = fresh_session()
             _last_auth_time = time.time()
             try:
-                r = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={
-                    "universe": "TOP3000",
-                    "region": "GLOBAL",
-                    "delay": 0,
-                    "decay": 0,
-                    "neutralization": "INDUSTRIAL",
-                    "truncation": 0.1,
-                    "pasteurization": True,
-                    "unitHandling": "VERIFY",
-                    "nanHandling": "OFF",
-                    "language": "PINVOKE",
-                    "visualization": "STAIRS"
-                }, timeout=30)
+                r = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
             except Exception as e:
                 log(f"❌ SC submit retry failed: {e}", "error")
                 return False
         
-        if r.status_code == 403:
-            # SC already computed - 403 response contains SC check result!
+        if r.status_code in (200, 201, 202):
+            log(f"   SC submitted (HTTP {r.status_code})")
+        elif r.status_code == 403:
+            # SC already computed
             try:
                 body = r.json()
                 checks = body.get("is", {}).get("checks", []) if isinstance(body.get("is"), dict) else []
                 sc = next((c for c in checks if c["name"] == "SELF_CORRELATION"), None)
-                if sc:
+                if sc and sc.get("result") != "PENDING":
                     cand["sc_value"] = sc.get("value")
                     cand["sc_result"] = sc.get("result")
-                    log(f"📊 SC={sc.get('value')} ({sc.get('result')}) ← from 403 response")
-                    
-                    # SC pass
-                    if sc.get("result") == "PASS":
-                        log(f"✅ SC PASSED! {cand['name']} SC={sc.get('value')}")
-                        notify(f"SC PASS ✅ {cand['name']}\\nSC={sc.get('value')}", emoji="✅")
-                        return True
-                    
-                    # SC fail - extract the reason
-                    limit = sc.get('limit')
-                    value = sc.get('value')
-                    log(f"❌ SC FAIL: SC={value} > limit={limit}")
-                    
-                    # Store SC value for feedback loop
-                    _wqdb.record_alpha_event(
-                        name=cand.get("name", ""), expr=cand.get("expr", ""),
-                        event_type="sc_fail",
-                        alpha_id=alpha_id,
-                        sc_value=value,
-                        sc_result="FAIL",
-                        phase="sc_submit"
-                    )
-                    self._track_skeleton_outcome(cand, "sc_fail", sc_value=value)
-                    
-                    # If SC value is very high (>0.9), add hint to expression modifier
-                    if value and value > 0.9:
-                        log(f"⚠️ SC value too high ({value} > 0.9) - will add ts_* operators", "warn")
-                    
-                    return False
-            except Exception as e:
-                log(f"❌ Failed to parse SC result from 403: {e}", "error")
-                return False
-        elif r.status_code in (200, 201, 202):
-            log(f"   SC submitted (HTTP {r.status_code})")
-            # Poll for result
-            def sc_ready(data):
-                checks_data = data.get("is", {}).get("checks", []) if isinstance(data.get("is"), dict) else []
-                sc = next((c for c in checks_data if c["name"] == "SELF_CORRELATION"), None)
-                if sc and sc.get("result") != "PENDING":
-                    return sc
-                if data.get("status") == "ACTIVE":
-                    return {"result": "PASS", "value": 0}
-                return None
-            
-            sc_result, self.s = adaptive_poll(
-                self.s, f"{API}/alphas/{alpha_id}",
-                f"SC {cand['name']}",
-                sc_ready, max_wait=3600,
-                initial_interval=30, fallback_interval=120,
-                stuck_threshold=60
-            )
-            
-            if sc_result is not None and sc_result.get("result") == "PASS":
-                cand["sc_result"] = "PASS"
-                return True
-            else:
-                log(f"⏸️ SC for {cand['name']} aborted/stuck", "warn")
-                cand["sc_result"] = "SC_TIMEOUT_PENDING"
-                return False
+                    log(f"   SC={sc.get('value')} (from 403)")
+                    return sc.get("result") == "PASS"
+            except: pass
+            log(f"   403 but no SC yet, polling...")
         else:
             log(f"❌ SC submit: HTTP {r.status_code} {r.text[:100]}", "error")
             return False
-
+        
+        # Adaptive SC poll
+        def sc_ready(data):
+            checks_data = data.get("is", {}).get("checks", []) if isinstance(data.get("is"), dict) else []
+            sc = next((c for c in checks_data if c["name"] == "SELF_CORRELATION"), None)
+            if sc and sc.get("result") != "PENDING":
+                return sc
+            if data.get("status") == "ACTIVE":
+                return {"result": "PASS", "value": 0}
+            return None
+        
+        sc_result, self.s = adaptive_poll(
+            self.s, f"{API}/alphas/{alpha_id}",
+            f"SC {cand['name']}",
+            sc_ready, max_wait=7200,  # 2h — SC can take 30-60+ min on congested queues
+            initial_interval=30, fallback_interval=120,
+            stuck_threshold=5400  # abort only if stuck at same % for 90 min (SC is slow)
+        )
+        
+        # Handle early abort from stuck detection
+        if sc_result is None:
+            # Distinguish timeout vs stuck: check if progress ever moved
+            # conservative: treat as TIMEOUT_PENDING (non-fatal)
+            log(f"⏸️ SC for {cand['name']} aborted/stuck, marking as SC_TIMEOUT_PENDING", "warn")
+            cand["sc_result"] = "SC_TIMEOUT_PENDING"
+            _wqdb.record_alpha_event(
+                name=cand.get("name", ""), expr=cand.get("expr", ""),
+                event_type="sc_timeout_pending",
+                alpha_id=alpha_id,
+                sharpe=cand.get("sharpe"),
+                fitness=cand.get("fitness"),
+                sc_result="SC_TIMEOUT_PENDING",
+                phase="sc_submit"
+            )
+            notify(f"SC卡住延期 ⏸️ {cand['name']} (排队拥堵/进度停滞，2h后重试)\nS={cand.get('sharpe')} SC=pending",
+                   emoji="⏸️", dedup_key=f"sc_pending_{alpha_id}")
+            return False  # graceful, don't crash main loop
+        
+        if not sc_result:
+            # Try 403 probe as fallback — probe the alpha to get SC result
+            try:
+                r3 = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
+                if r3.status_code == 401:
+                    log("⚠️ 401 on SC probe, refreshing session...", "warn")
+                    self.s = fresh_session()
+                    _last_auth_time = time.time()
+                    r3 = self.s.post(f"{API}/alphas/{alpha_id}/submit", json={}, timeout=30)
+                if r3.status_code == 403:
+                    body = r3.json()
+                    checks = body.get("is", {}).get("checks", []) if isinstance(body.get("is"), dict) else []
+                    sc = next((c for c in checks if c["name"] == "SELF_CORRELATION"), None)
+                    if sc and sc.get("result") != "PENDING":
+                        sc_result = sc
+                    else:
+                        log(f"⚠️ 403 probe: SC still pending or no SC found")
+                else:
+                    log(f"⚠️ 403 probe: got HTTP {r3.status_code}, expected 403")
+            except Exception as e:
+                log(f"⚠️ 403 probe error: {e}")
+        
+        if not sc_result:
+            cand["sc_result"] = "TIMEOUT"
+            return False
+        
+        cand["sc_value"] = sc_result.get("value")
+        cand["sc_result"] = sc_result.get("result")
+        is_pass = sc_result.get("result") == "PASS"
+        
+        log(f"📊 SC={cand['sc_value']} result={cand['sc_result']}")
+        
+        # ── RECORD: SC pass/fail ──
+        _wqdb.record_alpha_event(
+            name=cand.get("name", ""), expr=cand.get("expr", ""),
+            event_type="sc_pass" if is_pass else "sc_fail",
+            alpha_id=alpha_id,
+            sharpe=cand.get("sharpe"),
+            fitness=cand.get("fitness"),
+            sc_value=cand.get("sc_value"),
+            sc_result=cand.get("sc_result"),
+            phase="sc_submit"
+        )
+        
+        # ── RECORD: quadruple SC regression data (v3.17) ──
+        # Extract quadruples from this expression and record SC outcome
+        # Only for MULT-style expressions that have quadruples
+        try:
+            quads = _extract_field_quadruples(cand.get("expr", ""))
+            for quad in quads:
+                qk = _normalize_quad_key(quad)
+                if qk:
+                    _wqdb.record_quadruple_sc(qk, is_pass)
+                    log(f"    📈 quad {qk} SC={'PASS' if is_pass else 'FAIL'} (regression record)")
+        except:
+            pass  # Non-MULT expression, no quadruples to record
+        
+        if is_pass:
+            notify(f"SC通过 ✅ {cand['name']}\nSC={cand['sc_value']}\n{cand['expr'][:60]}",
+                   emoji="✅", dedup_key=f"sc_{cand.get('alpha_id','')}")
+        return is_pass
+    
     def probe_wq_queue_health(self, max_tries: int = 3) -> dict:
         """
         Pre-SC-submission health probe: checks WQ SC queue congestion state.
@@ -4210,11 +3885,7 @@ class Workflow:
             sk_data["is_pass"] += 1
         if outcome in ("sc_pass",):
             sk_data["sc_pass"] += 1
-        if outcome in ("sc_fail",):
-            sk_data["sc_fail"] = sk_data.get("sc_fail", 0) + 1
-        # sc_pass_rate should be sc_pass / (sc_pass + sc_fail), not sc_pass / attempts
-        sk_sc_total = sk_data["sc_pass"] + sk_data.get("sc_fail", 0)
-        sk_data["sc_pass_rate"] = sk_data["sc_pass"] / max(sk_sc_total, 1)
+            sk_data["sc_pass_rate"] = sk_data["sc_pass"] / max(sk_data["attempts"], 1)
         sk_data["is_pass_rate"] = sk_data["is_pass"] / max(sk_data["attempts"], 1)
         # Weighted score: pass_rate * avg_sharpe * sc_bonus
         sc_bonus = 1.0 + sk_data.get("sc_pass_rate", 0) * 2
@@ -4437,45 +4108,20 @@ class Workflow:
                     _generate_new_ratio_variations(cand, variations, ortho, max_tune_attempts)
 
         elif failed_phase == "sc":
-            # ── SC fail: cross-skeleton escape (v5) ──
-            # Root cause: SC failure is NOT about fields — it's about structural self-correlation.
-            # The same skeleton (e.g. mult_ratio) repeatedly collides with existing ACTIVE alphas.
-            # Strategy: (1) Check if this skeleton has 2+ SC failures → if so, SKIP to new skeleton
-            #           (2) Try neutralization on same expr (quick wins)
-            #           (3) AST topology mutations (different skeletons)
-            #           (4) Generate cross-skeleton candidates from the generator pool
+            # ── SC fail: AST residual pruning (v4 — Task 3) ──
+            # 核心思想：SC 失败不是字段问题，而是结构自相关太高。
+            # 不要换字段，而是对原表达式做 AST 级残差化修剪，打破自相关模式。
+            # 保留 IS 验证过的信号质量，只修改自相关结构。
             
             base_expr = cand.get("expr", "")
             base_name = cand.get("name", "orig")
-            base_skeleton = cand.get("skeleton", "unknown")
-            state = self.state
-            
-            # Cross-skeleton exhaustion check:
-            # Count SC failures per skeleton from skeleton_popularity
-            pop = state.get("skeleton_popularity", {})
-            sk_sc_fail_rate = 0.0
-            if base_skeleton in pop:
-                sk_data = pop[base_skeleton]
-                sk_sc_fail_rate = 1.0 - sk_data.get("sc_pass_rate", 0.0)
+            if not base_expr:
+                log(f"  ⚠️ SC fail: no base expr, skipping", "warn")
             else:
-                sk_sc_fail_rate = 0.0
-            
-            log(f"  🔬 SC cross-skeleton escape on '{base_name}' (skel={base_skeleton})")
-            log(f"    Skeleton sc_fail_rate: {sk_sc_fail_rate:.2f}")
-            
-            # Phase 0: If skeleton has high SC fail rate (sc_pass_rate < 0.3) AND
-            # the skeleton has more than 1 failed attempt, skip to new skeleton
-            skip_to_new_skeleton = (
-                base_skeleton in pop and
-                pop[base_skeleton].get("sc_pass_rate", 0) < 0.3 and
-                pop[base_skeleton].get("attempts", 0) >= 2
-            )
-            
-            if skip_to_new_skeleton:
-                log(f"  🔄 Skeleton {base_skeleton} exhausted (sc_pass_rate={pop[base_skeleton].get('sc_pass_rate', 0):.2f}, attempts={pop[base_skeleton].get('attempts', 0)}), skipping to new skeleton")
-            else:
-                # Phase 1: Neutralization dimension degradation (same expr — quick win)
-                # Only try if we haven't already exhausted this skeleton
+                log(f"  🔬 SC AST residual pruning on '{base_name}': {base_expr[:80]}")
+                
+                # Phase 1: Neutralization dimension degradation (keep existing logic — proven effective)
+                # 最细粒度的中性化可能消除伪相关
                 log(f"  🔍 Phase 1: Neutralization degradation (SECTOR/SUBINDUSTRY)")
                 for ndim in ["SECTOR", "SUBINDUSTRY"]:
                     if not self.running:
@@ -4491,9 +4137,10 @@ class Workflow:
                     else:
                         log(f"    {ndim} neutralization failed")
             
-            # Phase 2: AST residual pruning — topological mutations to break self-correlation
-            # These mutations produce different skeletons (NONLINEAR_BREAKER, DEEP_CASCADE, TSRANK_CORR, etc.)
-            if base_expr and not skip_to_new_skeleton:
+            # Phase 2: AST residual pruning — 对原表达式做拓扑变异，而非换字段
+            # 这是关键创新：SC 失败是因为信号模式太"干净"，被 SC 检测为自相关
+            # 通过残差化（差分/z-score/排名）破坏模式重复性，保留信号本质
+            if base_expr:
                 builder = DynamicSkeletonBuilder()
                 ast_mutations = builder.mutate_expr_topology(base_expr, ortho, active_exprs, max_variants=8)
                 if ast_mutations:
@@ -4504,7 +4151,7 @@ class Workflow:
                         var_name = f"{base_name}_mut_{mut['name']}"[:40]
                         log(f"    Mutation: {mut['name']} → {mut['expr'][:100]}")
                         
-                        # Ensure expression length is reasonable
+                        # 确保表达式长度合理
                         if len(mut["expr"]) > 300:
                             log(f"      ⚠️ Expr too long ({len(mut['expr'])} chars), skipping")
                             continue
@@ -4518,124 +4165,75 @@ class Workflow:
                         else:
                             log(f"    Mutation {mut['name']} SC failed")
             
-            # Phase 3: Cross-skeleton fallback — generate candidates from DIFFERENT skeleton types
-            # When current skeleton is exhausted OR all AST mutations failed,
-            # generate candidates from the generator pool with a different skeleton focus
-            log(f"  🔄 Phase 3: Generating cross-skeleton candidates...")
-            cross_skeletons = []
-            for sk_candidate in [
-                ("sub_delta", _generate_sub_candidates),
-                ("direct_rank", _generate_direct_rank_candidates),
-                ("three_term", _generate_three_term_candidates),
-            ]:
-                sk_name, gen_func = sk_candidate
-                active_exprs = self._get_active_expressions()
-                cross_skeletons.append((sk_name, gen_func(ortho, active_exprs)))
+            # Phase 3: If AST pruning failed, fall back to legacy field pair swap
+            # 保留原有逻辑作为兜底
+            log(f"  ⚠️ Phase 3: AST pruning exhausted — falling back to field pair swap")
+            field_usage = ortho["fields_used"]
+            used_pairs = ortho.get("field_pairs_used", set())
             
-            # Sort by orthogonality score and take top candidates from each cross-skeleton
-            cross_cands = []
-            for sk_name, candidates in cross_skeletons:
-                for c in candidates[:3]:  # Top 3 from each cross-skeleton
-                    c["cross_skeleton"] = sk_name
-                    cross_cands.append(c)
+            fund_denoms = ["cap", "enterprise_value", "equity"]
+            pv1_denoms = ["close", "volume", "adv20", "vwap", "low", "high", "open"]
+            denoms = [d for d in denoms if field_usage.get(d, 0) <= 2]
             
-            cross_cands.sort(key=lambda x: -x.get("orthogonality_score", 0))
+            fund_nums = ["revenue", "operating_income", "debt"]
+            pv1_nums = ["returns", "volume", "low", "high"]
+            nums = [n for n in fund_nums + pv1_nums if field_usage.get(n, 0) <= 1 and n not in ["close"]]
             
-            if cross_cands:
-                log(f"  Generated {len(cross_cands)} cross-skeleton candidates")
-                for cc in cross_cands[:5]:
-                    log(f"    [{cc['cross_skeleton']}] {cc['name']}: {cc['expr'][:80]}")
-                
-                # Try cross-skeleton candidates
-                for cc in cross_cands:
-                    if not self.running:
-                        return False
-                    var_name = f"cross_{cc['cross_skeleton']}_{cc['name']}"[:40]
-                    log(f"    Cross-skeleton attempt: {cc['cross_skeleton']} → {cc['name']}")
-                    log(f"      expr: {cc['expr']}")
+            mom_pool = [
+                ("ts_mean(volume,5)", "vol_mom"),
+                ("ts_mean(adv20,5)", "adv_mom"),
+                ("log(volume)", "log_vol"),
+            ]
+            
+            pair_count = 0
+            for num in nums[:6]:
+                for den in denoms[:4]:
+                    if num == den:
+                        continue
+                    pair = frozenset([num, den])
+                    if pair in used_pairs:
+                        continue
+                    g1 = "fund" if num in FUND_FIELDS else "pv1"
+                    g2 = "fund" if den in FUND_FIELDS else "pv1"
+                    if g1 != g2:
+                        continue
                     
-                    override = dict(DEFAULT_SETTINGS) if settings_override else dict(DEFAULT_SETTINGS)
-                    payload = {"type": "REGULAR", "regular": cc["expr"], "settings": override}
-                    success = self._run_single_sim_and_sc(var_name, payload, cand, failed_phase, max_tune_attempts, is_optimization)
-                    if success:
-                        log(f"  ✅ SC passed via cross-skeleton: {cc['cross_skeleton']}")
-                        return True
-                    else:
-                        log(f"    Cross-skeleton {cc['cross_skeleton']} failed")
-            
-            # Phase 4: Last resort — field pair swap on MULT_RATIO (only if not already exhausted)
-            if not skip_to_new_skeleton:
-                log(f"  ⚠️ Phase 4: All cross-skeleton attempts exhausted — falling back to field pair swap")
-                field_usage = ortho["fields_used"]
-                used_pairs = ortho.get("field_pairs_used", set())
-                
-                fund_denoms = ["cap", "enterprise_value", "equity"]
-                pv1_denoms = ["close", "volume", "adv20", "vwap", "low", "high", "open"]
-                denoms = [d for d in fund_denoms if field_usage.get(d, 0) <= 2]
-                
-                fund_nums = ["revenue", "operating_income", "debt"]
-                pv1_nums = ["returns", "volume", "low", "high"]
-                nums = [n for n in fund_nums + pv1_nums if field_usage.get(n, 0) <= 1 and n not in ["close"]]
-                
-                mom_pool = [
-                    ("ts_mean(volume,5)", "vol_mom"),
-                    ("ts_mean(adv20,5)", "adv_mom"),
-                    ("log(volume)", "log_vol"),
-                ]
-                
-                pair_count = 0
-                for num in nums[:6]:
-                    for den in denoms[:4]:
-                        if num == den:
+                    for num2 in nums[:6]:
+                        if num2 == num:
                             continue
-                        pair = frozenset([num, den])
-                        if pair in used_pairs:
-                            continue
-                        g1 = "fund" if num in FUND_FIELDS else "pv1"
-                        g2 = "fund" if den in FUND_FIELDS else "pv1"
-                        if g1 != g2:
-                            continue
-                        
-                        for num2 in nums[:6]:
-                            if num2 == num:
+                        for den2 in denoms[:4]:
+                            if den2 == den or num2 == den2:
                                 continue
-                            for den2 in denoms[:4]:
-                                if den2 == den or num2 == den2:
-                                    continue
-                                pair2 = frozenset([num2, den2])
-                                if pair2 in used_pairs:
-                                    continue
-                                if {num, den} & {num2, den2}:
-                                    continue
-                                g1b = "fund" if num2 in FUND_FIELDS else "pv1"
-                                g2b = "fund" if den2 in FUND_FIELDS else "pv1"
-                                if g1b != g2b:
-                                    continue
-                                
-                                for (mom, mom_name) in mom_pool[:2]:
-                                    for w in [0.5, 0.7]:
-                                        expr = f"rank({num}/{den})*rank({num2}/{den2})+{w}*rank({mom})"
-                                        if expr not in [v["expr"] for v in variations]:
-                                            name = f"SCtune_{num[:3]}{den[:3]}_{num2[:3]}{den2[:3]}_{mom_name[:4]}w{int(w*10)}"[:40]
-                                            variations.append({
-                                                "name": name,
-                                                "expr": expr,
-                                                "weight": w,
-                                                "orthogonality_score": cand.get("orthogonality_score", 0) + 2,
-                                            })
-                                            pair_count += 1
-                                            if pair_count >= max_tune_attempts:
-                                                break
-                                if pair_count >= max_tune_attempts:
-                                    break
+                            pair2 = frozenset([num2, den2])
+                            if {num, den} & {num2, den2}:
+                                continue
+                            g1b = "fund" if num2 in FUND_FIELDS else "pv1"
+                            g2b = "fund" if den2 in FUND_FIELDS else "pv1"
+                            if g1b != g2b:
+                                continue
+                            
+                            for (mom, mom_name) in mom_pool[:2]:
+                                for w in [0.5, 0.7]:
+                                    expr = f"rank({num}/{den})*rank({num2}/{den2})+{w}*rank({mom})"
+                                    if expr not in [v["expr"] for v in variations]:
+                                        name = f"SCtune_{num[:3]}{den[:3]}_{num2[:3]}{den2[:3]}_{mom_name[:4]}w{int(w*10)}"[:40]
+                                        variations.append({
+                                            "name": name,
+                                            "expr": expr,
+                                            "weight": w,
+                                            "orthogonality_score": cand.get("orthogonality_score", 0) + 2,
+                                        })
+                                        pair_count += 1
+                                        if pair_count >= max_tune_attempts:
+                                            break
+                            if pair_count >= max_tune_attempts:
+                                break
                         if pair_count >= max_tune_attempts:
                             break
                 if pair_count >= max_tune_attempts:
-                    pass  # All pairs tried
-        else:
-            # skip_to_new_skeleton is True — no Phase 4, just report
-            pass
+                    break
         
+        # Try each variation
         log(f"  Generated {len(variations)} tuned variations")
         
         for v_idx, var in enumerate(variations):
