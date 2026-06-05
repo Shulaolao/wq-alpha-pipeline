@@ -1,0 +1,1 @@
+# WQ Dashboard — modular package
