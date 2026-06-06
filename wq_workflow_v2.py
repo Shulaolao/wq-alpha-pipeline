@@ -66,6 +66,28 @@ TARGET_ACTIVE = 20
 _TOKEN_REFRESH_INTERVAL = 3 * 3600  # 3 hours
 _last_auth_time = 0  # set by fresh_session()
 
+# ── Session pool for parallel threading (v3.24 Phase-2) ──
+import threading
+class SessionPool:
+    """线程安全的 WQ API session 池，每个线程独立 fresh_session()"""
+    def __init__(self, max_workers: int = 4):
+        self.max_workers = max_workers
+        self._lock = threading.Lock()
+        self._sessions = []
+    
+    def get_session(self) -> requests.Session:
+        """获取独立 session，若池空则 fresh_session()"""
+        with self._lock:
+            if self._sessions:
+                return self._sessions.pop()
+        return fresh_session()  # 无锁创建（fresh_session 内部已处理全局变量）
+    
+    def return_session(self, s: requests.Session):
+        """归还 session 到池"""
+        with self._lock:
+            if len(self._sessions) < self.max_workers:
+                self._sessions.append(s)
+
 # ── Default settings ──
 DEFAULT_SETTINGS = {
     "instrumentType": "EQUITY", "region": "USA", "universe": "TOP3000",
@@ -3863,6 +3885,230 @@ class Workflow:
                    emoji="🔧", dedup_key=f"is_tune_{cand.get('alpha_id','')}")
 
         return is_pass or soft_pass
+
+    # ── v3.24 Phase-2: 并行回测（ThreadPoolExecutor） ──
+    @staticmethod
+    def _process_single_candidate_async(cand: dict, session_data: dict, api_url: str) -> dict:
+        """
+        纯函数版本的回测处理，用于 ThreadPoolExecutor 并行调用。
+        不修改全局变量，所有状态通过返回值传递。
+        
+        session_data: 包含 session 的 pickleable 字典（token + headers）
+        """
+        import copy
+        from requests import Session
+        
+        # 重建 session
+        s = Session()
+        s.headers.update(session_data.get("headers", {}))
+        # 注意：WQ session 包含动态 token，无法直接 pickle
+        # 实际使用时需每次重新认证（或传入 fresh_session 函数句柄）
+        # 这里采用简化方案：返回 candidate 状态，由主进程处理
+        
+        # 由于 WQ session 无法跨线程共享，此函数暂不实际执行回测
+        # 仅作为架构占位，实际并行逻辑见 _run_full_sim_parallel()
+        return cand
+
+    def _run_full_sim_thread(self, cand: dict, s: requests.Session) -> bool:
+        """
+        线程安全版本的 _run_full_sim，使用独立 session。
+        不修改 self.state，仅修改 cand。
+        用于 ThreadPoolExecutor 并行调用。
+        """
+        import math
+        
+        # ── 1. POST simulation ──
+        payload = {"type": "REGULAR", "regular": cand["expr"], "settings": DEFAULT_SETTINGS}
+        
+        try:
+            r = s.post(f"{API}/simulations", json=payload, timeout=90)
+        except Exception as e:
+            log(f"❌ POST sim failed: {e}", "error")
+            cand["error"] = str(e)
+            return False
+        
+        # Auto-refresh on 401（线程独立 refresh）
+        if r.status_code == 401:
+            log("⚠️ 401 on sim POST, refreshing session...", "warn")
+            s = fresh_session()
+            _last_auth_time = time.time()
+            try:
+                r = s.post(f"{API}/simulations", json=payload, timeout=90)
+            except Exception as e:
+                log(f"❌ Sim retry POST failed: {e}", "error")
+                return False
+        
+        if r.status_code == 429:
+            retry = int(r.headers.get("Retry-After", 900))
+            wait = min(retry, 120)
+            log(f"⚠️ 429: waiting {wait}s (Retry-After: {retry})")
+            time.sleep(wait)
+            try:
+                r = s.post(f"{API}/simulations", json=payload, timeout=90)
+            except Exception as e:
+                log(f"❌ Retry failed: {e}", "error")
+                return False
+        
+        if r.status_code != 201:
+            log(f"❌ Sim create: HTTP {r.status_code} {r.text[:100]}", "error")
+            return False
+        
+        sim_id = r.headers.get("Location", "").split("/")[-1]
+        cand["sim_id"] = sim_id
+        log(f"📝 sim_id={sim_id}")
+        
+        def is_ready(data):
+            alpha_id = data.get("alpha")
+            return alpha_id if alpha_id else None
+        
+        alpha_id, s = adaptive_poll(
+            s, f"{API}/simulations/{sim_id}",
+            f"IS {cand['name']}",
+            is_ready, max_wait=3600,
+            initial_interval=15, fallback_interval=60,
+            stuck_threshold=300
+        )
+        
+        if not alpha_id:
+            cand["is_status"] = "TIMEOUT"
+            return False
+        
+        cand["alpha_id"] = alpha_id
+        log(f"✅ sim resolved: alpha_id={alpha_id}")
+        
+        r2 = s.get(f"{API}/alphas/{alpha_id}", timeout=30)
+        if r2.status_code != 200:
+            log(f"⚠️ Fetch alpha: HTTP {r2.status_code}")
+            return False
+        
+        ad = r2.json()
+        checks = ad.get("is", {}).get("checks", []) if isinstance(ad.get("is"), dict) else []
+        stats = ad.get("is", {}) if isinstance(ad.get("is"), dict) else {}
+        
+        cand["sharpe"] = stats.get("sharpe")
+        cand["fitness"] = stats.get("fitness")
+        
+        # ── v3.23 hotfix: compute local fitness with stability penalty ──
+        def compute_local_fitness(sharpe_val: float, fitness_val: float, checks: list) -> float:
+            N = len(checks)
+            if N < 2:
+                ir_std = 1.0
+            else:
+                ir_std = sharpe_val / math.sqrt(N) if sharpe_val > 0 else 1.0
+            k = 0.5
+            stability_score = max(0.0, 1.0 - k * ir_std)
+            
+            turn_score = 1.0
+            for c in checks:
+                if c.get("name") == "turnover":
+                    turn_val = c.get("value", 0.5)
+                    if turn_val < 0.3:
+                        turn_score = turn_val / 0.3
+                    elif turn_val > 0.8:
+                        turn_score = max(0.0, 1.0 - (turn_val - 0.8) / 0.2)
+                    else:
+                        turn_score = 1.0
+                    break
+            
+            local_fitness = (
+                0.30 * (fitness_val or 0) +
+                0.25 * (1.0 - max_dd_estimate(fitness_val)) +
+                0.25 * turn_score +
+                0.20 * stability_score
+            )
+            return min(1.0, local_fitness)
+        
+        def max_dd_estimate(f: float) -> float:
+            return max(0.0, 1.0 - f) if f is not None else 0.5
+        
+        cand["local_fitness"] = compute_local_fitness(stats.get("sharpe"), stats.get("fitness"), checks)
+        
+        # ── v3.23 hotfix: local pre-screen ──
+        if cand["local_fitness"] < 0.7:
+            log(f"🚨 LOCAL FITNESS CUTOFF: F_local={cand['local_fitness']:.2f} < 0.7, skip SC")
+        
+        # ── v3.24 Phase-1: 三分法 IS/Val/Test ──
+        train_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][:13]
+        val_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][13:19]
+        train_sharpe_list = [s for s in train_sharpe_list if s is not None]
+        val_sharpe_list = [s for s in val_sharpe_list if s is not None]
+        
+        cand["train_sharpe"] = sum(train_sharpe_list) / len(train_sharpe_list) if train_sharpe_list else None
+        cand["val_sharpe"] = sum(val_sharpe_list) / len(val_sharpe_list) if val_sharpe_list else None
+        
+        log(f"📊 IS 分段: Train-S={cand.get('train_sharpe', '?'):.2f} Val-S={cand.get('val_sharpe', '?'):.2f}")
+        
+        # Val 过滤
+        if cand["val_sharpe"] is not None and cand["val_sharpe"] < 1.0:
+            log(f"❌ VAL FILTER: ValSharpe={cand['val_sharpe']:.2f} < 1.0, skipped SC test")
+            cand["is_status"] = "FAIL_VAL"
+            return False
+        
+        passes = sum(1 for c in checks if c.get("result") == "PASS")
+        fails = sum(1 for c in checks if c.get("result") == "FAIL")
+        
+        sharpe_val = stats.get("sharpe")
+        fitness_val = stats.get("fitness")
+        
+        is_pass = (sharpe_val is not None and fails <= 1 and passes >= 6)
+        soft_pass = (sharpe_val is not None and fails <= 2 and passes >= 4
+                     and not is_pass
+                     and (sharpe_val >= 1.25
+                          or (sharpe_val >= 1.0 and fitness_val is not None and fitness_val >= 0.8)))
+        
+        cand["is_status"] = "PASS" if is_pass else ("TUNE" if soft_pass else "FAIL")
+        log(f"📊 IS: S={cand['sharpe']} F={cand['fitness']} | {passes}P/{fails}F | {cand['is_status']}")
+        
+        if is_pass:
+            notify(f"IS PASS ✅ {cand['name']}\nS={cand['sharpe']} F={cand['fitness']} F_local={cand.get('local_fitness', '?'):.2f}\n{cand['expr'][:80]}",
+                   emoji="✅", dedup_key=f"is_{cand.get('alpha_id','')}")
+        
+        return is_pass or soft_pass
+
+    def _run_full_sim_parallel(self, candidates: list, max_workers: int = 4) -> list:
+        """
+        并行执行 _run_full_sim，返回结果列表。
+        使用 SessionPool + ThreadPoolExecutor 实现线程安全并行。
+        
+        参数：
+            candidates: 候选列表
+            max_workers: 并行工作者数（默认 4）
+        返回：
+            results: 每个候选的处理结果（True/False）
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        pool = SessionPool(max_workers=max_workers)
+        results = []
+        
+        def process_one(idx_cand):
+            idx, cand = idx_cand
+            s = pool.get_session()
+            try:
+                result = self._run_full_sim_thread(cand, s)
+                return (idx, result, cand)
+            finally:
+                pool.return_session(s)
+        
+        # 使用线程池并行处理
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_one, (idx, cand)): (idx, cand) 
+                      for idx, cand in enumerate(candidates)}
+            
+            for future in as_completed(futures):
+                try:
+                    idx, result, cand = future.result()
+                    results.append((idx, result, cand))
+                except Exception as e:
+                    log(f"❌ Thread error: {e}", "error")
+                    results.append((idx, False, candidates[idx]))
+        
+        # 按原始顺序排序
+        results.sort(key=lambda x: x[0])
+        results_list = [r[1] for r in results]
+        
+        log(f"⚡️ 并行回测完成: {len(results_list)} 候选，{sum(results_list)} 通过")
+        return results_list
     
     def _run_sc(self, cand: dict) -> bool:
         """Submit SC → get immediate result. WQ returns SC check in 403 response."""
