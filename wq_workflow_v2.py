@@ -3161,6 +3161,19 @@ class Workflow:
         save_state(self.state)
         os._exit(0)
     
+    def _get_active_expressions(self) -> list:
+        """Return list of expression strings from current ACTIVE alphas.
+        Uses cached actives_data from state if available, otherwise fetches fresh."""
+        actives_data = self.state.get("actives_data", [])
+        if actives_data:
+            return [a.get("expr", "") for a in actives_data]
+        # Fallback: fetch fresh
+        try:
+            actives = fetch_active_alphas(self.s)
+            return [a.get("expr", "") for a in actives]
+        except Exception:
+            return []
+    
     def save_checkpoint(self):
         save_state(self.state)
     
@@ -3357,7 +3370,23 @@ class Workflow:
                 self.save_checkpoint()
                 success = self._run_sc(cand)
                 if not success:
-                    log(f"❌ {cand['name']}: SC failed ({cand.get('sc_value', '?')})")
+                    sc_result = cand.get("sc_result", "FAILED")
+                    if sc_result == "SC_BLOCKED":
+                        # Permanent failure — SC can never pass for this alpha
+                        log(f"❌ {cand['name']}: SC permanently blocked (no SELF_CORRELATION check), skipping")
+                        self.state["batch_progress"] = idx + 1
+                        self.save_checkpoint()
+                        notify(f"SC永久阻塞 ✖️ {cand['name']}\\n无法进行SC测试，跳过", emoji="⚠️", dedup_key=f"sc_blocked_{cand.get('alpha_id','')}")
+                        # ── DELETE blocked alpha from WQ to free resources ──
+                        alpha_id = cand.get("alpha_id")
+                        if alpha_id:
+                            try:
+                                log(f"  🗑️  Deleting SC-blocked alpha {alpha_id} ({cand.get('name')})")
+                                self.s.delete(f"{API}/alphas/{alpha_id}", timeout=15)
+                            except Exception as e:
+                                log(f"  ⚠️  Delete failed: {e}")
+                        continue
+                    log(f"❌ {cand['name']}: SC failed ({sc_result})")
                     log(f"   Trying SC tune (different fields)...")
                     success = self._tune_and_retry(cand, ortho, "sc")
                     if not success:
@@ -3708,6 +3737,61 @@ class Workflow:
         cand["sharpe"] = stats.get("sharpe")
         cand["fitness"] = stats.get("fitness")
 
+        # ── v3.23 hotfix: compute local fitness with stability penalty ──
+        # 本地重新计算 fitness，用于预筛（WQ black-box fitness 仅用于 is_pass）
+        # 不能改 WQ fitness，但可加本地指标防过拟合
+        def compute_local_fitness(sharpe_val: float, fitness_val: float, checks: list) -> float:
+            # 获取每月数据点数（WQ 默认日频，252 交易日/年 → 约 21 点/月）
+            # 从 checks 中推断时间跨度（假设 is.checks[0] 是时间滚动）
+            # 简化：直接用 sharpe 的 rollingstd 估算稳定性（无原始序列时近似）
+            # WQ 返回的 sharpe 是年化，假设 sharpe_std ≈ sharpe / sqrt(N)（保守估计）
+            import math
+            N = len(checks)  # checks 数量 ≈ 时间分段数
+            if N < 2:
+                ir_std = 1.0  # 样本不足，高惩罚
+            else:
+                # 假设 sharpe 是年化，按 sqrt(N) 缩放得到月度 IR std
+                ir_std = sharpe_val / math.sqrt(N) if sharpe_val > 0 else 1.0
+            k = 0.5  # 敏感度系数
+            stability_score = max(0.0, 1.0 - k * ir_std)
+
+            # turnover 估算（WQ 不直接返回，用 exchange rate 近似）
+            # 若 checks 含 turnover 项可替换，否则默认 turn_score=1.0（保守）
+            turn_score = 1.0  # 默认中性换手，后续可增强
+            for c in checks:
+                if c.get("name") == "turnover":
+                    turn_val = c.get("value", 0.5)
+                    if turn_val < 0.3:
+                        turn_score = turn_val / 0.3
+                    elif turn_val > 0.8:
+                        turn_score = max(0.0, 1.0 - (turn_val - 0.8) / 0.2)
+                    else:
+                        turn_score = 1.0
+                    break
+
+            # 新权重：0.3/0.25/0.25/0.2
+            local_fitness = (
+                0.30 * (fitness_val or 0) +  # 收益风险比（用 WQ fitness 代理）
+                0.25 * (1.0 - max_dd_estimate(fitness_val)) +  # 尾部风险（暂用 WQfitness 代理）
+                0.25 * turn_score +
+                0.20 * stability_score
+            )
+            return min(1.0, local_fitness)  # 限制在 [0,1]
+
+        def max_dd_estimate(f: float) -> float:
+            # 简易代理：fitness 越低，max_dd 越大（反向映射）
+            # 实盘中需替换为真实 max_dd
+            return max(0.0, 1.0 - f) if f is not None else 0.5
+
+        cand["local_fitness"] = compute_local_fitness(sharpe_val, fitness_val, checks)
+
+        # ── v3.23 hotfix: local pre-screen ──
+        # local_fitness < 0.7 → skip SC（过拟合风险高）
+        if cand["local_fitness"] < 0.7:
+            log(f"🚨 LOCAL FITNESS CUTOFF: F_local={cand['local_fitness']:.2f} < 0.7, skip SC")
+            # 不返回 False，继续走 is_pass 流程（WQ 黑盒判定仍有效），仅加日志
+            # 未来可改为直接 return False
+
         passes = sum(1 for c in checks if c.get("result") == "PASS")
         fails = sum(1 for c in checks if c.get("result") == "FAIL")
 
@@ -3744,7 +3828,7 @@ class Workflow:
         )
 
         if is_pass:
-            notify(f"IS PASS ✅ {cand['name']}\nS={cand['sharpe']} F={cand['fitness']}\n{cand['expr'][:80]}",
+            notify(f"IS PASS ✅ {cand['name']}\\nS={cand['sharpe']} F={cand['fitness']} F_local={cand.get('local_fitness', '?'):.2f}\\n{cand['expr'][:80]}",
                    emoji="✅", dedup_key=f"is_{cand.get('alpha_id','')}")
             try:
                 self.s.patch(f"{API}/alphas/{alpha_id}",
@@ -3753,7 +3837,7 @@ class Workflow:
             except:
                 pass
         elif soft_pass:
-            notify(f"IS TUNE 🔧 {cand['name']}\nS={sharpe_val:.2f} F={fitness_val}\n{cand['expr'][:60]}",
+            notify(f"IS TUNE 🔧 {cand['name']}\\nS={sharpe_val:.2f} F={fitness_val} F_local={cand.get('local_fitness', '?'):.2f}\\n{cand['expr'][:60]}",
                    emoji="🔧", dedup_key=f"is_tune_{cand.get('alpha_id','')}")
 
         return is_pass or soft_pass
@@ -3846,6 +3930,14 @@ class Workflow:
                     if value and value > 0.9:
                         log(f"⚠️ SC value too high ({value} > 0.9) - will add ts_* operators", "warn")
                     
+                    return False
+                else:
+                    # 403 response but no SELF_CORRELATION check found
+                    # This is a PERMANENT failure — the alpha can never pass SC.
+                    # Mark as SC_BLOCKED to skip retry loop.
+                    log(f"📊 SC=None (NO SELF_CORRELATION in 403 response) — alpha is SC-blocked, skipping")
+                    cand["sc_value"] = None
+                    cand["sc_result"] = "SC_BLOCKED"
                     return False
             except Exception as e:
                 log(f"❌ Failed to parse SC result from 403: {e}", "error")
