@@ -3792,6 +3792,28 @@ class Workflow:
             # 不返回 False，继续走 is_pass 流程（WQ 黑盒判定仍有效），仅加日志
             # 未来可改为直接 return False
 
+        # ── v3.24 Phase-1: 三分法 IS/Val/Test（基于 WQ 滚动窗口） ──
+        # WQ 不支持自定义时间区间，用 checks 分段作为代理：
+        # checks[0]~checks[12] ≈ 2018-2021 (Train), checks[13]~checks[18] ≈ 2022-2023 (Val)
+        train_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][:13]  # 前13个季度
+        val_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][13:19]  # 后6个季度
+
+        # 计算 Train/ValSharpe（仅保留非 None）
+        train_sharpe_list = [s for s in train_sharpe_list if s is not None]
+        val_sharpe_list = [s for s in val_sharpe_list if s is not None]
+
+        cand["train_sharpe"] = sum(train_sharpe_list) / len(train_sharpe_list) if train_sharpe_list else None
+        cand["val_sharpe"] = sum(val_sharpe_list) / len(val_sharpe_list) if val_sharpe_list else None
+
+        log(f"📊 IS 分段: Train-S={cand.get('train_sharpe', '?'):.2f} Val-S={cand.get('val_sharpe', '?'):.2f}")
+
+        # Val 过滤：若 ValSharpe < 1.0 → 直接跳过 SC（防过拟合）
+        if cand["val_sharpe"] is not None and cand["val_sharpe"] < 1.0:
+            log(f"❌ VAL FILTER: ValSharpe={cand['val_sharpe']:.2f} < 1.0, skipped SC test")
+            # 标记为特殊状态，不进入后续流程
+            cand["is_status"] = "FAIL_VAL"
+            return False
+
         passes = sum(1 for c in checks if c.get("result") == "PASS")
         fails = sum(1 for c in checks if c.get("result") == "FAIL")
 
@@ -3837,7 +3859,7 @@ class Workflow:
             except:
                 pass
         elif soft_pass:
-            notify(f"IS TUNE 🔧 {cand['name']}\\nS={sharpe_val:.2f} F={fitness_val} F_local={cand.get('local_fitness', '?'):.2f}\\n{cand['expr'][:60]}",
+            notify(f"IS TUNE 🔧 {cand['name']}\nS={sharpe_val:.2f} F={fitness_val} F_local={cand.get('local_fitness', '?'):.2f}\nTrain-S={cand.get('train_sharpe', '?'):.2f} Val-S={cand.get('val_sharpe', '?'):.2f}\n{cand['expr'][:60]}",
                    emoji="🔧", dedup_key=f"is_tune_{cand.get('alpha_id','')}")
 
         return is_pass or soft_pass
