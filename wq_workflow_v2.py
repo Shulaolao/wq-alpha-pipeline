@@ -4110,6 +4110,107 @@ class Workflow:
         log(f"⚡️ 并行回测完成: {len(results_list)} 候选，{sum(results_list)} 通过")
         return results_list
     
+    def _process_batch_parallel(self, candidates: list) -> list:
+        """
+        批处理候选，返回处理后的候选列表（含 backtesting + tune + sc 结果）。
+        使用 _run_full_sim_parallel() 并行回测，后续处理保持串行（state 安全）。
+        
+        返回：成功提交到 SC 的候选列表（已通过 IS + SC）
+        """
+        log(f"\n{'='*50}")
+        log(f"⚡️ v3.25 Batch Parallel: {len(candidates)} candidates")
+        
+        # 阶段 1: 收集通过 quick_test 的候选
+        batch_to_sim = []
+        for idx, cand in enumerate(candidates):
+            if not self.running:
+                return batch_to_sim  # 提前退出
+            
+            log(f"\n{'='*50}")
+            log(f"🎯 Quick test {idx+1}/{len(candidates)}: {cand['name']}")
+            
+            quick_pass = self._quick_test(cand)
+            if quick_pass == "skip":
+                log(f"⏩ {cand['name']}: S=None detected, skip (dead pair)")
+                self._track_skeleton_outcome(cand, "quick_skip")
+                _wqdb.record_alpha_event(
+                    name=cand["name"], expr=cand["expr"],
+                    event_type="failed",
+                    is_status="S=None",
+                    phase="quick_test",
+                    notes="Dead pair: S=None"
+                )
+                failed_list = self.state.setdefault("failed_expressions", [])
+                expr = cand.get("expr", "")
+                if expr and expr not in failed_list:
+                    failed_list.append(expr)
+                    log(f"  📝 Registered dead pair ({len(failed_list)} total)")
+                continue
+            if not quick_pass:
+                log(f"⏩ {cand['name']}: quick test failed, skip (S<1.0)")
+                self._track_skeleton_outcome(cand, "quick_fail")
+                continue
+            
+            batch_to_sim.append((idx, cand))
+        
+        if not batch_to_sim:
+            log("⚠️ No candidates passed quick test")
+            return []
+        
+        # 阶段 2: 批量并行回测
+        log(f"\n⚡️ Starting parallel backtesting for {len(batch_to_sim)} candidates...")
+        try:
+            batch_results = self._run_full_sim_parallel(batch_to_sim, max_workers=4)
+        except Exception as e:
+            log(f"❌ Parallel backtesting failed: {e}, falling back to serial", "error")
+            # 降级为串行
+            batch_results = [self._run_full_sim(cand) for (_, cand) in batch_to_sim]
+        
+        # 阶段 3: 处理回测结果（串行，state 安全）
+        successful_candidates = []
+        for (idx, cand), result in zip(batch_to_sim, batch_results):
+            if not self.running:
+                break
+            
+            if not result:
+                # Full sim failed, try tuning
+                success = self._tune_and_retry(cand, {}, "is")
+                if not success:
+                    log(f"✖️ {cand['name']}: all IS variations failed, skip")
+                    _wqdb.record_alpha_event(
+                        name=cand["name"], expr=cand.get("expr", ""),
+                        event_type="failed",
+                        alpha_id=cand.get("alpha_id"),
+                        sharpe=cand.get("sharpe"),
+                        is_status="IS_FAIL",
+                        phase="full_sim",
+                        notes="All IS variations failed"
+                    )
+                    self._track_skeleton_outcome(cand, "is_fail", cand.get("sharpe"))
+                    continue
+            elif cand.get("is_status") == "TUNE":
+                # IS passed but borderline, try tuning
+                success = self._tune_and_retry(cand, {}, "is")
+                if not success:
+                    log(f"✖️ {cand['name']}: tune also couldn't fix checks, skip")
+                    continue
+            
+            # IS PASS — proceed to SC
+            self._track_skeleton_outcome(cand, "is_pass", cand.get("sharpe"))
+            
+            # SC SUBMIT
+            success = self._run_sc(cand)
+            if success:
+                successful_candidates.append(cand)
+            else:
+                # SC failed, try SC tune
+                success = self._tune_and_retry(cand, {}, "sc")
+                if success:
+                    successful_candidates.append(cand)
+        
+        log(f"\n✅ Batch complete: {len(successful_candidates)}/{len(batch_to_sim)} passed SC")
+        return successful_candidates
+    
     def _run_sc(self, cand: dict) -> bool:
         """Submit SC → get immediate result. WQ returns SC check in 403 response."""
         alpha_id = cand.get("alpha_id")
