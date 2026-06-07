@@ -66,28 +66,6 @@ TARGET_ACTIVE = 20
 _TOKEN_REFRESH_INTERVAL = 3 * 3600  # 3 hours
 _last_auth_time = 0  # set by fresh_session()
 
-# ── Session pool for parallel threading (v3.24 Phase-2) ──
-import threading
-class SessionPool:
-    """线程安全的 WQ API session 池，每个线程独立 fresh_session()"""
-    def __init__(self, max_workers: int = 4):
-        self.max_workers = max_workers
-        self._lock = threading.Lock()
-        self._sessions = []
-    
-    def get_session(self) -> requests.Session:
-        """获取独立 session，若池空则 fresh_session()"""
-        with self._lock:
-            if self._sessions:
-                return self._sessions.pop()
-        return fresh_session()  # 无锁创建（fresh_session 内部已处理全局变量）
-    
-    def return_session(self, s: requests.Session):
-        """归还 session 到池"""
-        with self._lock:
-            if len(self._sessions) < self.max_workers:
-                self._sessions.append(s)
-
 # ── Default settings ──
 DEFAULT_SETTINGS = {
     "instrumentType": "EQUITY", "region": "USA", "universe": "TOP3000",
@@ -2521,9 +2499,13 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
                 failed_skeleton_counts[sk] = failed_skeleton_counts.get(sk, 0) + 1
     total_failed = sum(failed_skeleton_counts.values())
     
+    # Adaptive rotation: shift phase if any skeleton dominates the failed pool
     # ── v3.19 Selection with Intra-Batch Diversity (P5) ──
     # Instead of taking n consecutive candidates from one skeleton group,
     # use a round-robin approach across skeleton types to ensure diversity.
+    
+    # Phase mapping: cycle through skeleton types.
+    # Dynamically deprioritize skeletons with high failure rates.
     # SUB has 432 failed attempts (0 SC pass) — deprioritize when failed_expressions > 0.
     # MULT_RATIO has moderate SC fail. NEW_SKELETONS (TS_STD, VOL_DECAY, ZSCORE_MOM,
     # cross-gate, temporal-wrap, DSB) are untested in SC — try them when old skeletons saturate.
@@ -2587,19 +2569,32 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
         # Fallback: use all deduped
         result = deduped[:n]
     else:
-        # Round-robin: take top candidate from each non-empty group, cycling until n reached
+        # Round-robin with blocked-skeleton filtering:
+        # Skip candidates and entire groups where ALL members have
+        # composite_score=-999 (blocked by SC fail rate >= 90%).
+        # This prevents blocked skeletons from monopolizing the batch.
         result = []
         seen_exprs_in_result = set()
+        blocked_groups_skipped = 0
         max_rounds = max(len(g) for _, g in non_empty) if non_empty else 0
         for round_idx in range(max_rounds):
             for name, g in non_empty:
                 if round_idx < len(g):
                     c = g[round_idx]
+                    # Skip blocked candidates (composite_score=-999.0)
+                    if c.get("composite_score", 1) == -999.0:
+                        continue
                     if c["expr"] not in seen_exprs_in_result and len(result) < n:
                         result.append(c)
                         seen_exprs_in_result.add(c["expr"])
             if len(result) >= n:
                 break
+        # Log how many groups were entirely blocked
+        all_blocked = sum(1 for _, g in non_empty if all(
+            c.get("composite_score", 1) == -999.0 for c in g
+        ))
+        if all_blocked:
+            log(f"  🚫 {all_blocked}/{len(non_empty)} skeleton groups entirely blocked (all candidates composite_score=-999)")
     
     seen_skeletons_in_batch = set(c.get("skeleton", "unknown") for c in result)
     
@@ -3305,7 +3300,30 @@ class Workflow:
                     return
                 log(f"\n{'='*50}")
                 log(f"🎯 Processing candidate {idx+1}/{len(candidates)}: {cand['name']}")
-                
+
+                # ── PRE-CHECK: Skip orthogonality-negative candidates ──
+                ortho_score = cand.get("orthogonality_score", 0)
+                if ortho_score < 0:
+                    log(f"⏩ {cand['name']}: orthogonality_score={ortho_score:.1f} < 0, skip (field overlap too high)")
+                    self._track_skeleton_outcome(cand, "quick_skip")
+                    # Register as failed to prevent re-selection
+                    failed_list = self.state.setdefault("failed_expressions", [])
+                    expr = cand.get("expr", "")
+                    if expr and expr not in failed_list:
+                        failed_list.append(expr)
+                        if len(failed_list) > 100:
+                            self.state["failed_expressions"] = failed_list[-100:]
+                        log(f"  📝 Registered ortho-negative failure ({len(failed_list)} total)")
+                    _wqdb.record_alpha_event(
+                        name=cand["name"], expr=cand["expr"],
+                        event_type="failed",
+                        phase="generate",
+                        notes=f"Negative orthogonality ({ortho_score:.1f})"
+                    )
+                    self.state["batch_progress"] = idx + 1
+                    self.save_checkpoint()
+                    continue
+
                 # ── RECORD: Generated ──
                 _wqdb.record_alpha_event(
                     name=cand["name"], expr=cand["expr"],
@@ -3785,83 +3803,6 @@ class Workflow:
         cand["sharpe"] = stats.get("sharpe")
         cand["fitness"] = stats.get("fitness")
 
-        # ── v3.23 hotfix: compute local fitness with stability penalty ──
-        # 本地重新计算 fitness，用于预筛（WQ black-box fitness 仅用于 is_pass）
-        # 不能改 WQ fitness，但可加本地指标防过拟合
-        def compute_local_fitness(sharpe_val: float, fitness_val: float, checks: list) -> float:
-            # 获取每月数据点数（WQ 默认日频，252 交易日/年 → 约 21 点/月）
-            # 从 checks 中推断时间跨度（假设 is.checks[0] 是时间滚动）
-            # 简化：直接用 sharpe 的 rollingstd 估算稳定性（无原始序列时近似）
-            # WQ 返回的 sharpe 是年化，假设 sharpe_std ≈ sharpe / sqrt(N)（保守估计）
-            import math
-            N = len(checks)  # checks 数量 ≈ 时间分段数
-            if N < 2:
-                ir_std = 1.0  # 样本不足，高惩罚
-            else:
-                # 假设 sharpe 是年化，按 sqrt(N) 缩放得到月度 IR std
-                ir_std = sharpe_val / math.sqrt(N) if sharpe_val > 0 else 1.0
-            k = 0.5  # 敏感度系数
-            stability_score = max(0.0, 1.0 - k * ir_std)
-
-            # turnover 估算（WQ 不直接返回，用 exchange rate 近似）
-            # 若 checks 含 turnover 项可替换，否则默认 turn_score=1.0（保守）
-            turn_score = 1.0  # 默认中性换手，后续可增强
-            for c in checks:
-                if c.get("name") == "turnover":
-                    turn_val = c.get("value", 0.5)
-                    if turn_val < 0.3:
-                        turn_score = turn_val / 0.3
-                    elif turn_val > 0.8:
-                        turn_score = max(0.0, 1.0 - (turn_val - 0.8) / 0.2)
-                    else:
-                        turn_score = 1.0
-                    break
-
-            # 新权重：0.3/0.25/0.25/0.2
-            local_fitness = (
-                0.30 * (fitness_val or 0) +  # 收益风险比（用 WQ fitness 代理）
-                0.25 * (1.0 - max_dd_estimate(fitness_val)) +  # 尾部风险（暂用 WQfitness 代理）
-                0.25 * turn_score +
-                0.20 * stability_score
-            )
-            return min(1.0, local_fitness)  # 限制在 [0,1]
-
-        def max_dd_estimate(f: float) -> float:
-            # 简易代理：fitness 越低，max_dd 越大（反向映射）
-            # 实盘中需替换为真实 max_dd
-            return max(0.0, 1.0 - f) if f is not None else 0.5
-
-        cand["local_fitness"] = compute_local_fitness(sharpe_val, fitness_val, checks)
-
-        # ── v3.23 hotfix: local pre-screen ──
-        # local_fitness < 0.7 → skip SC（过拟合风险高）
-        if cand["local_fitness"] < 0.7:
-            log(f"🚨 LOCAL FITNESS CUTOFF: F_local={cand['local_fitness']:.2f} < 0.7, skip SC")
-            # 不返回 False，继续走 is_pass 流程（WQ 黑盒判定仍有效），仅加日志
-            # 未来可改为直接 return False
-
-        # ── v3.24 Phase-1: 三分法 IS/Val/Test（基于 WQ 滚动窗口） ──
-        # WQ 不支持自定义时间区间，用 checks 分段作为代理：
-        # checks[0]~checks[12] ≈ 2018-2021 (Train), checks[13]~checks[18] ≈ 2022-2023 (Val)
-        train_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][:13]  # 前13个季度
-        val_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][13:19]  # 后6个季度
-
-        # 计算 Train/ValSharpe（仅保留非 None）
-        train_sharpe_list = [s for s in train_sharpe_list if s is not None]
-        val_sharpe_list = [s for s in val_sharpe_list if s is not None]
-
-        cand["train_sharpe"] = sum(train_sharpe_list) / len(train_sharpe_list) if train_sharpe_list else None
-        cand["val_sharpe"] = sum(val_sharpe_list) / len(val_sharpe_list) if val_sharpe_list else None
-
-        log(f"📊 IS 分段: Train-S={cand.get('train_sharpe', '?'):.2f} Val-S={cand.get('val_sharpe', '?'):.2f}")
-
-        # Val 过滤：若 ValSharpe < 1.0 → 直接跳过 SC（防过拟合）
-        if cand["val_sharpe"] is not None and cand["val_sharpe"] < 1.0:
-            log(f"❌ VAL FILTER: ValSharpe={cand['val_sharpe']:.2f} < 1.0, skipped SC test")
-            # 标记为特殊状态，不进入后续流程
-            cand["is_status"] = "FAIL_VAL"
-            return False
-
         passes = sum(1 for c in checks if c.get("result") == "PASS")
         fails = sum(1 for c in checks if c.get("result") == "FAIL")
 
@@ -3898,7 +3839,7 @@ class Workflow:
         )
 
         if is_pass:
-            notify(f"IS PASS ✅ {cand['name']}\\nS={cand['sharpe']} F={cand['fitness']} F_local={cand.get('local_fitness', '?'):.2f}\\n{cand['expr'][:80]}",
+            notify(f"IS PASS ✅ {cand['name']}\nS={cand['sharpe']} F={cand['fitness']}\n{cand['expr'][:80]}",
                    emoji="✅", dedup_key=f"is_{cand.get('alpha_id','')}")
             try:
                 self.s.patch(f"{API}/alphas/{alpha_id}",
@@ -3907,359 +3848,10 @@ class Workflow:
             except:
                 pass
         elif soft_pass:
-            notify(f"IS TUNE 🔧 {cand['name']}\nS={sharpe_val:.2f} F={fitness_val} F_local={cand.get('local_fitness', '?'):.2f}\nTrain-S={cand.get('train_sharpe', '?'):.2f} Val-S={cand.get('val_sharpe', '?'):.2f}\n{cand['expr'][:60]}",
+            notify(f"IS TUNE 🔧 {cand['name']}\nS={sharpe_val:.2f} F={fitness_val}\n{cand['expr'][:60]}",
                    emoji="🔧", dedup_key=f"is_tune_{cand.get('alpha_id','')}")
 
         return is_pass or soft_pass
-
-    # ── v3.24 Phase-2: 并行回测（ThreadPoolExecutor） ──
-    @staticmethod
-    def _process_single_candidate_async(cand: dict, session_data: dict, api_url: str) -> dict:
-        """
-        纯函数版本的回测处理，用于 ThreadPoolExecutor 并行调用。
-        不修改全局变量，所有状态通过返回值传递。
-        
-        session_data: 包含 session 的 pickleable 字典（token + headers）
-        """
-        import copy
-        from requests import Session
-        
-        # 重建 session
-        s = Session()
-        s.headers.update(session_data.get("headers", {}))
-        # 注意：WQ session 包含动态 token，无法直接 pickle
-        # 实际使用时需每次重新认证（或传入 fresh_session 函数句柄）
-        # 这里采用简化方案：返回 candidate 状态，由主进程处理
-        
-        # 由于 WQ session 无法跨线程共享，此函数暂不实际执行回测
-        # 仅作为架构占位，实际并行逻辑见 _run_full_sim_parallel()
-        return cand
-
-    def _run_full_sim_thread(self, cand: dict, s: requests.Session) -> bool:
-        """
-        线程安全版本的 _run_full_sim，使用独立 session。
-        不修改 self.state，仅修改 cand。
-        用于 ThreadPoolExecutor 并行调用。
-        """
-        import math
-        
-        # ── 1. POST simulation ──
-        payload = {"type": "REGULAR", "regular": cand["expr"], "settings": DEFAULT_SETTINGS}
-        
-        try:
-            r = s.post(f"{API}/simulations", json=payload, timeout=90)
-        except Exception as e:
-            log(f"❌ POST sim failed: {e}", "error")
-            cand["error"] = str(e)
-            return False
-        
-        # Auto-refresh on 401（线程独立 refresh）
-        if r.status_code == 401:
-            log("⚠️ 401 on sim POST, refreshing session...", "warn")
-            s = fresh_session()
-            _last_auth_time = time.time()
-            try:
-                r = s.post(f"{API}/simulations", json=payload, timeout=90)
-            except Exception as e:
-                log(f"❌ Sim retry POST failed: {e}", "error")
-                return False
-        
-        if r.status_code == 429:
-            retry = int(r.headers.get("Retry-After", 900))
-            wait = min(retry, 120)
-            log(f"⚠️ 429: waiting {wait}s (Retry-After: {retry})")
-            time.sleep(wait)
-            try:
-                r = s.post(f"{API}/simulations", json=payload, timeout=90)
-            except Exception as e:
-                log(f"❌ Retry failed: {e}", "error")
-                return False
-        
-        if r.status_code != 201:
-            log(f"❌ Sim create: HTTP {r.status_code} {r.text[:100]}", "error")
-            return False
-        
-        sim_id = r.headers.get("Location", "").split("/")[-1]
-        cand["sim_id"] = sim_id
-        log(f"📝 sim_id={sim_id}")
-        
-        def is_ready(data):
-            alpha_id = data.get("alpha")
-            return alpha_id if alpha_id else None
-        
-        alpha_id, s = adaptive_poll(
-            s, f"{API}/simulations/{sim_id}",
-            f"IS {cand['name']}",
-            is_ready, max_wait=3600,
-            initial_interval=15, fallback_interval=60,
-            stuck_threshold=300
-        )
-        
-        if not alpha_id:
-            cand["is_status"] = "TIMEOUT"
-            return False
-        
-        cand["alpha_id"] = alpha_id
-        log(f"✅ sim resolved: alpha_id={alpha_id}")
-        
-        r2 = s.get(f"{API}/alphas/{alpha_id}", timeout=30)
-        if r2.status_code != 200:
-            log(f"⚠️ Fetch alpha: HTTP {r2.status_code}")
-            return False
-        
-        ad = r2.json()
-        checks = ad.get("is", {}).get("checks", []) if isinstance(ad.get("is"), dict) else []
-        stats = ad.get("is", {}) if isinstance(ad.get("is"), dict) else {}
-        
-        cand["sharpe"] = stats.get("sharpe")
-        cand["fitness"] = stats.get("fitness")
-        
-        # ── v3.23 hotfix: compute local fitness with stability penalty ──
-        def compute_local_fitness(sharpe_val: float, fitness_val: float, checks: list) -> float:
-            N = len(checks)
-            if N < 2:
-                ir_std = 1.0
-            else:
-                ir_std = sharpe_val / math.sqrt(N) if sharpe_val > 0 else 1.0
-            k = 0.5
-            stability_score = max(0.0, 1.0 - k * ir_std)
-            
-            turn_score = 1.0
-            for c in checks:
-                if c.get("name") == "turnover":
-                    turn_val = c.get("value", 0.5)
-                    if turn_val < 0.3:
-                        turn_score = turn_val / 0.3
-                    elif turn_val > 0.8:
-                        turn_score = max(0.0, 1.0 - (turn_val - 0.8) / 0.2)
-                    else:
-                        turn_score = 1.0
-                    break
-            
-            local_fitness = (
-                0.30 * (fitness_val or 0) +
-                0.25 * (1.0 - max_dd_estimate(fitness_val)) +
-                0.25 * turn_score +
-                0.20 * stability_score
-            )
-            return min(1.0, local_fitness)
-        
-        def max_dd_estimate(f: float) -> float:
-            return max(0.0, 1.0 - f) if f is not None else 0.5
-        
-        cand["local_fitness"] = compute_local_fitness(stats.get("sharpe"), stats.get("fitness"), checks)
-        
-        # ── v3.23 hotfix: local pre-screen ──
-        if cand["local_fitness"] < 0.7:
-            log(f"🚨 LOCAL FITNESS CUTOFF: F_local={cand['local_fitness']:.2f} < 0.7, skip SC")
-        
-        # ── v3.24 Phase-1: 三分法 IS/Val/Test ──
-        train_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][:13]
-        val_sharpe_list = [c.get("value") for c in checks if c.get("name") == "sharpe"][13:19]
-        train_sharpe_list = [s for s in train_sharpe_list if s is not None]
-        val_sharpe_list = [s for s in val_sharpe_list if s is not None]
-        
-        cand["train_sharpe"] = sum(train_sharpe_list) / len(train_sharpe_list) if train_sharpe_list else None
-        cand["val_sharpe"] = sum(val_sharpe_list) / len(val_sharpe_list) if val_sharpe_list else None
-        
-        log(f"📊 IS 分段: Train-S={cand.get('train_sharpe', '?'):.2f} Val-S={cand.get('val_sharpe', '?'):.2f}")
-        
-        # Val 过滤
-        if cand["val_sharpe"] is not None and cand["val_sharpe"] < 1.0:
-            log(f"❌ VAL FILTER: ValSharpe={cand['val_sharpe']:.2f} < 1.0, skipped SC test")
-            cand["is_status"] = "FAIL_VAL"
-            return False
-        
-        passes = sum(1 for c in checks if c.get("result") == "PASS")
-        fails = sum(1 for c in checks if c.get("result") == "FAIL")
-        
-        sharpe_val = stats.get("sharpe")
-        fitness_val = stats.get("fitness")
-        
-        is_pass = (sharpe_val is not None and fails <= 1 and passes >= 6)
-        soft_pass = (sharpe_val is not None and fails <= 2 and passes >= 4
-                     and not is_pass
-                     and (sharpe_val >= 1.25
-                          or (sharpe_val >= 1.0 and fitness_val is not None and fitness_val >= 0.8)))
-        
-        cand["is_status"] = "PASS" if is_pass else ("TUNE" if soft_pass else "FAIL")
-        log(f"📊 IS: S={cand['sharpe']} F={cand['fitness']} | {passes}P/{fails}F | {cand['is_status']}")
-        
-        if is_pass:
-            notify(f"IS PASS ✅ {cand['name']}\nS={cand['sharpe']} F={cand['fitness']} F_local={cand.get('local_fitness', '?'):.2f}\n{cand['expr'][:80]}",
-                   emoji="✅", dedup_key=f"is_{cand.get('alpha_id','')}")
-        
-        return is_pass or soft_pass
-
-    def _run_full_sim_parallel(self, candidates: list, max_workers: int = 4) -> list:
-        """
-        并行执行 _run_full_sim，返回结果列表。
-        使用 SessionPool + ThreadPoolExecutor 实现线程安全并行。
-        
-        参数：
-            candidates: 候选列表
-            max_workers: 并行工作者数（默认 4）
-        返回：
-            results: 每个候选的处理结果（True/False）
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        pool = SessionPool(max_workers=max_workers)
-        results = []
-        
-        def process_one(idx_cand):
-            idx, cand = idx_cand
-            s = pool.get_session()
-            try:
-                result = self._run_full_sim_thread(cand, s)
-                return (idx, result, cand)
-            finally:
-                pool.return_session(s)
-        
-        # 使用线程池并行处理
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(process_one, (idx, cand)): (idx, cand) 
-                      for idx, cand in enumerate(candidates)}
-            
-            for future in as_completed(futures):
-                try:
-                    idx, result, cand = future.result()
-                    results.append((idx, result, cand))
-                except Exception as e:
-                    log(f"❌ Thread error: {e}", "error")
-                    results.append((idx, False, candidates[idx]))
-        
-        # 按原始顺序排序
-        results.sort(key=lambda x: x[0])
-        results_list = [r[1] for r in results]
-        
-        log(f"⚡️ 并行回测完成: {len(results_list)} 候选，{sum(results_list)} 通过")
-        return results_list
-    
-    def _process_batch_parallel(self, candidates: list) -> list:
-        """
-        批处理候选，返回处理后的候选列表（含 backtesting + tune + sc 结果）。
-        使用 _run_full_sim_parallel() 并行回测，后续处理保持串行（state 安全）。
-        
-        返回：成功提交到 SC 的候选列表（已通过 IS + SC）
-        """
-        log(f"\n{'='*50}")
-        log(f"⚡️ v3.25 Batch Parallel: {len(candidates)} candidates")
-        
-        # 阶段 1: 收集通过 quick_test 的候选
-        batch_to_sim = []
-        for idx, cand in enumerate(candidates):
-            if not self.running:
-                return batch_to_sim  # 提前退出
-            
-            log(f"\n{'='*50}")
-            log(f"🎯 Quick test {idx+1}/{len(candidates)}: {cand['name']}")
-            
-            quick_pass = self._quick_test(cand)
-            if quick_pass == "skip":
-                log(f"⏩ {cand['name']}: S=None detected, skip (dead pair)")
-                self._track_skeleton_outcome(cand, "quick_skip")
-                _wqdb.record_alpha_event(
-                    name=cand["name"], expr=cand["expr"],
-                    event_type="failed",
-                    is_status="S=None",
-                    phase="quick_test",
-                    notes="Dead pair: S=None"
-                )
-                failed_list = self.state.setdefault("failed_expressions", [])
-                expr = cand.get("expr", "")
-                if expr and expr not in failed_list:
-                    failed_list.append(expr)
-                    log(f"  📝 Registered dead pair ({len(failed_list)} total)")
-                continue
-            if not quick_pass:
-                log(f"⏩ {cand['name']}: quick test failed, skip (S<1.0)")
-                self._track_skeleton_outcome(cand, "quick_fail")
-                # ── REGISTER: S<1.0 failures into failed_expressions to prevent re-selection ──
-                failed_list = self.state.setdefault("failed_expressions", [])
-                expr = cand.get("expr", "")
-                if expr and expr not in failed_list:
-                    failed_list.append(expr)
-                    if len(failed_list) > 100:
-                        self.state["failed_expressions"] = failed_list[-100:]
-                    log(f"  📝 Registered S<1.0 failure ({len(failed_list)} total)")
-                continue
-            
-            batch_to_sim.append((idx, cand))
-        
-        if not batch_to_sim:
-            log("⚠️ No candidates passed quick test")
-            return []
-        
-        # 阶段 2: 批量并行回测
-        log(f"\n⚡️ Starting parallel backtesting for {len(batch_to_sim)} candidates...")
-        try:
-            batch_results = self._run_full_sim_parallel(batch_to_sim, max_workers=4)
-        except Exception as e:
-            log(f"❌ Parallel backtesting failed: {e}, falling back to serial", "error")
-            # 降级为串行
-            batch_results = [self._run_full_sim(cand) for (_, cand) in batch_to_sim]
-        
-        # 阶段 3: 处理回测结果（串行，state 安全）
-        successful_candidates = []
-        for (idx, cand), result in zip(batch_to_sim, batch_results):
-            if not self.running:
-                break
-            
-            if not result:
-                # Full sim failed, try tuning
-                success = self._tune_and_retry(cand, {}, "is")
-                if not success:
-                    log(f"✖️ {cand['name']}: all IS variations failed, skip")
-                    _wqdb.record_alpha_event(
-                        name=cand["name"], expr=cand.get("expr", ""),
-                        event_type="failed",
-                        alpha_id=cand.get("alpha_id"),
-                        sharpe=cand.get("sharpe"),
-                        is_status="IS_FAIL",
-                        phase="full_sim",
-                        notes="All IS variations failed"
-                    )
-                    self._track_skeleton_outcome(cand, "is_fail", cand.get("sharpe"))
-                    # ── REGISTER: IS fail into failed_expressions to prevent re-selection ──
-                    failed_list = self.state.setdefault("failed_expressions", [])
-                    base_expr = cand.get("expr", "")
-                    if base_expr and base_expr not in failed_list:
-                        failed_list.append(base_expr)
-                        if len(failed_list) > 100:
-                            self.state["failed_expressions"] = failed_list[-100:]
-                        log(f"  📝 Registered IS fail ({len(failed_list)} total): {base_expr[:60]}")
-                    continue
-            elif cand.get("is_status") == "TUNE":
-                # IS passed but borderline, try tuning
-                success = self._tune_and_retry(cand, {}, "is")
-                if not success:
-                    log(f"✖️ {cand['name']}: tune also couldn't fix checks, skip")
-                    # ── REGISTER: tune fail into failed_expressions ──
-                    failed_list = self.state.setdefault("failed_expressions", [])
-                    base_expr = cand.get("expr", "")
-                    if base_expr and base_expr not in failed_list:
-                        failed_list.append(base_expr)
-                        if len(failed_list) > 100:
-                            self.state["failed_expressions"] = failed_list[-100:]
-                        log(f"  📝 Registered tune fail ({len(failed_list)} total): {base_expr[:60]}")
-                    continue
-            
-            # IS PASS — proceed to SC
-            self._track_skeleton_outcome(cand, "is_pass", cand.get("sharpe"))
-            
-            # SC SUBMIT
-            success = self._run_sc(cand)
-            if success:
-                successful_candidates.append(cand)
-            else:
-                # SC failed, try SC tune
-                success = self._tune_and_retry(cand, {}, "sc")
-                if success:
-                    successful_candidates.append(cand)
-        
-        log(f"\n✅ Batch complete: {len(successful_candidates)}/{len(batch_to_sim)} passed SC")
-        return successful_candidates
     
     def _run_sc(self, cand: dict) -> bool:
         """Submit SC → get immediate result. WQ returns SC check in 403 response."""
