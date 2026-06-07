@@ -15,6 +15,8 @@ import FieldHeatmap from '@/components/FieldHeatmap';
 import OrthogonalityGraph from '@/components/OrthogonalityGraph';
 import Timeline from '@/components/Timeline';
 import AlphaCompleteList from '@/components/AlphaCompleteList';
+import PerformanceMonitor from '@/components/PerformanceMonitor';
+import AlphaQuality from '@/components/AlphaQuality';
 
 export default function DashboardPage() {
   const [status, setStatus] = useState<PipelineStatus | null>(null);
@@ -76,6 +78,7 @@ export default function DashboardPage() {
         startedAt={status?.started_at || ''}
         duration={status?.duration || undefined}
         batch={`${status?.batch_index ?? 0}/${status?.batch_total ?? 0}`}
+        system={status?.system ?? null}
         refreshInterval={refreshMs}
         onRefreshIntervalChange={setRefreshMs}
       />
@@ -100,6 +103,19 @@ export default function DashboardPage() {
             candidate={status?.current_candidate ?? null}
             batchIndex={status?.batch_index}
             batchTotal={status?.batch_total}
+          />
+
+          {/* Alpha Quality — 插入在 CandidateCard 和 ActivityLog 之间 */}
+          <AlphaQuality
+            alphas={(status?.actives || []).map((a: any) => ({
+              id: a.id || a.name || 'unknown',
+              expr: a.expr || '',
+              sharpe: a.sharpe ?? undefined,
+              fitness: a.fitness ?? undefined,
+              sc_value: a.sc_value ?? undefined,
+            }))}
+            total={status?.active_count ?? 0}
+            target={status?.target ?? 20}
           />
 
           {/* Activity Log */}
@@ -133,6 +149,9 @@ export default function DashboardPage() {
             lastUpdated={status?.last_updated || ''}
             duration={status?.duration ?? undefined}
           />
+
+          {/* Performance Monitor — 新：系统性能监控 */}
+          <PerformanceMonitor stats={status?.system ?? null} />
 
           {/* Orthogonality Graph */}
           <OrthogonalityGraph data={orthData} />
