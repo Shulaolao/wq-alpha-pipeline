@@ -2521,69 +2521,87 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
                 failed_skeleton_counts[sk] = failed_skeleton_counts.get(sk, 0) + 1
     total_failed = sum(failed_skeleton_counts.values())
     
-    # Adaptive rotation: shift phase if any skeleton dominates the failed pool
-    rotation_phase = stuck_batches % 4  # 0-3 for 4 skeleton groups (SUB/MULT only)
-    
     # ── v3.19 Selection with Intra-Batch Diversity (P5) ──
     # Instead of taking n consecutive candidates from one skeleton group,
     # use a round-robin approach across skeleton types to ensure diversity.
+    # SUB has 432 failed attempts (0 SC pass) — deprioritize when failed_expressions > 0.
+    # MULT_RATIO has moderate SC fail. NEW_SKELETONS (TS_STD, VOL_DECAY, ZSCORE_MOM,
+    # cross-gate, temporal-wrap, DSB) are untested in SC — try them when old skeletons saturate.
+    dominant_skeleton = "sub_delta"
+    if failed_exprs:
+        total_failed = len(failed_exprs)
+        sk_exhaust = {}
+        for fe in failed_exprs:
+            sk = _classify_v3_skeleton(fe)
+            sk_exhaust[sk] = sk_exhaust.get(sk, 0) + 1
+        # Find most attempted skeleton
+        if sk_exhaust:
+            dominant_skeleton = max(sk_exhaust, key=sk_exhaust.get)
+            log(f"  📊 Skeleton exhaustion: dominant={dominant_skeleton} ({sk_exhaust.get(dominant_skeleton,0)}/{total_failed})")
     
-    # Phase mapping: each phase has a primary skeleton + secondary skeletons.
-    # v4 SC breakthrough: SUB is primary (proven IS pass + only SC-passing skeleton).
-    # DIRECT_RANK (0% IS, 195 attempts) and THREE_TERM (3.8% IS, 0% SC) are removed.
-    # MULT_RATIO is blocked by SC fail rate. Focus on SUB/MULT for SC breakthrough.
-    # 4 phases for 4 proven skeleton groups.
-    phase_map = {
-        0: (SKELETON_SUB, [SKELETON_MULT]),
-        1: (SKELETON_MULT, [SKELETON_SUB]),
-        2: (SKELETON_SUB, [SKELETON_MULT]),
-        3: (SKELETON_MULT, [SKELETON_SUB]),
-    }
-    
-    # ── v3.19 Selection — SUB/MULT only (v4 SC breakthrough) ──
-    # Simplified selection: rotate between SUB and MULT phases.
-    # All other skeleton types are deprecated (0% IS pass or 100% SC fail).
-    
-    # Build groups for SUB and MULT only
+    # Build groups for ALL skeleton types (not just SUB/MULT)
     sub_group = sorted_group(SKELETON_SUB)
     mult_group = sorted_group(SKELETON_MULT)
     pure_mult_group = sorted_group(SKELETON_PURE_MULT)
     cross_group = sorted_group(SKELETON_CROSS_GATE)
+    # New skeleton types (v3.19 SC breakthrough) — never selected due to SUB/MULT-only phase_map
+    ts_std_group = sorted_group(SKELETON_TSRANK_CORR)  # TS_STD and ZSCORE_MOM
+    vol_decay_group = sorted_group(SKELETON_TREND_BREAK)  # VOL_DECAY
+    ind_neut_group = sorted_group(SKELETON_IND_NEUT)
+    ratio_lag_group = sorted_group(SKELETON_SINGLE)  # RATIO_LAG
+    direct_rank_group = sorted_group(SKELETON_DIRECT_RANK)
+    three_term_group = sorted_group(SKELETON_THREE_TERM)
+    sign_switch_group = sorted_group(SKELETON_SIGN_SWITCH)
+    nonlinear_group = sorted_group(SKELETON_NONLINEAR_BREAKER)
+    vol_adj_group = sorted_group(SKELETON_VOL_ADJ)
+    residual_group = sorted_group(SKELETON_RESIDUAL)
+    deep_cascade_group = sorted_group(SKELETON_DEEP_CASCADE)
     
+    # Adaptive phase map: if dominant skeleton has >66% of failed attempts, skip it
     primary_group = []
     secondary_groups = []
     
-    if rotation_phase in (0, 2):
-        primary_group = sub_group
-        secondary_groups = [mult_group, pure_mult_group]
-    else:  # phases 1, 3
-        primary_group = mult_group if mult_group else sub_group
-        secondary_groups = [sub_group, pure_mult_group]
+    # Build prioritized list of (name, candidates) excluding over-saturated
+    available_groups = [
+        ("SUB", sub_group),
+        ("MULT", mult_group),
+        ("TS_STD", ts_std_group),
+        ("VOL_DECAY", vol_decay_group),
+        ("IND_NEUT", ind_neut_group),
+        ("RATIO_LAG", ratio_lag_group),
+        ("PURE_MULT", pure_mult_group),
+        ("CROSS_GATE", cross_group),
+        ("DIRECT_RANK", direct_rank_group),
+        ("THREE_TERM", three_term_group),
+        ("SIGN_SWITCH", sign_switch_group),
+        ("NONLINEAR", nonlinear_group),
+        ("VOL_ADJ", vol_adj_group),
+        ("RESIDUAL", residual_group),
+        ("DEEP_CASCADE", deep_cascade_group),
+    ]
     
-    result = []
-    seen_skeletons_in_batch = set()
+    # Filter out empty groups and build round-robin
+    non_empty = [(name, g) for name, g in available_groups if g]
     
-    # Select from primary group
-    for c in primary_group[:n]:
-        if c not in result and len(result) < n:
-            result.append(c)
-            sk = c.get("skeleton", "unknown")
-            seen_skeletons_in_batch.add(sk)
+    if not non_empty:
+        # Fallback: use all deduped
+        result = deduped[:n]
+    else:
+        # Round-robin: take top candidate from each non-empty group, cycling until n reached
+        result = []
+        seen_exprs_in_result = set()
+        max_rounds = max(len(g) for _, g in non_empty) if non_empty else 0
+        for round_idx in range(max_rounds):
+            for name, g in non_empty:
+                if round_idx < len(g):
+                    c = g[round_idx]
+                    if c["expr"] not in seen_exprs_in_result and len(result) < n:
+                        result.append(c)
+                        seen_exprs_in_result.add(c["expr"])
+            if len(result) >= n:
+                break
     
-    # Fill remaining from secondary groups
-    for sg in secondary_groups:
-        for c in sg:
-            if c not in result and len(result) < n:
-                result.append(c)
-                sk = c.get("skeleton", "unknown")
-                seen_skeletons_in_batch.add(sk)
-    
-    # Fallback: any remaining groups
-    for c in deduped:
-        if c not in result and len(result) < n:
-            result.append(c)
-    
-    result = result[:n]
+    seen_skeletons_in_batch = set(c.get("skeleton", "unknown") for c in result)
     
     log(f"  🎯 v3.19 selection: {len(result)} candidates, skeleton diversity: {len(seen_skeletons_in_batch)} types")
     for sk_type in seen_skeletons_in_batch:
@@ -3326,6 +3344,14 @@ class Workflow:
                 if not quick_pass:
                     log(f"⏩ {cand['name']}: quick test failed, skip (S<1.0)")
                     self._track_skeleton_outcome(cand, "quick_fail")
+                    # ── REGISTER: S<1.0 failures into failed_expressions to prevent re-selection ──
+                    failed_list = self.state.setdefault("failed_expressions", [])
+                    expr = cand.get("expr", "")
+                    if expr and expr not in failed_list:
+                        failed_list.append(expr)
+                        if len(failed_list) > 100:
+                            self.state["failed_expressions"] = failed_list[-100:]
+                        log(f"  📝 Registered S<1.0 failure ({len(failed_list)} total)")
                     self.state["batch_progress"] = idx + 1
                     self.save_checkpoint()
                     continue
@@ -4149,6 +4175,14 @@ class Workflow:
             if not quick_pass:
                 log(f"⏩ {cand['name']}: quick test failed, skip (S<1.0)")
                 self._track_skeleton_outcome(cand, "quick_fail")
+                # ── REGISTER: S<1.0 failures into failed_expressions to prevent re-selection ──
+                failed_list = self.state.setdefault("failed_expressions", [])
+                expr = cand.get("expr", "")
+                if expr and expr not in failed_list:
+                    failed_list.append(expr)
+                    if len(failed_list) > 100:
+                        self.state["failed_expressions"] = failed_list[-100:]
+                    log(f"  📝 Registered S<1.0 failure ({len(failed_list)} total)")
                 continue
             
             batch_to_sim.append((idx, cand))
@@ -4187,12 +4221,28 @@ class Workflow:
                         notes="All IS variations failed"
                     )
                     self._track_skeleton_outcome(cand, "is_fail", cand.get("sharpe"))
+                    # ── REGISTER: IS fail into failed_expressions to prevent re-selection ──
+                    failed_list = self.state.setdefault("failed_expressions", [])
+                    base_expr = cand.get("expr", "")
+                    if base_expr and base_expr not in failed_list:
+                        failed_list.append(base_expr)
+                        if len(failed_list) > 100:
+                            self.state["failed_expressions"] = failed_list[-100:]
+                        log(f"  📝 Registered IS fail ({len(failed_list)} total): {base_expr[:60]}")
                     continue
             elif cand.get("is_status") == "TUNE":
                 # IS passed but borderline, try tuning
                 success = self._tune_and_retry(cand, {}, "is")
                 if not success:
                     log(f"✖️ {cand['name']}: tune also couldn't fix checks, skip")
+                    # ── REGISTER: tune fail into failed_expressions ──
+                    failed_list = self.state.setdefault("failed_expressions", [])
+                    base_expr = cand.get("expr", "")
+                    if base_expr and base_expr not in failed_list:
+                        failed_list.append(base_expr)
+                        if len(failed_list) > 100:
+                            self.state["failed_expressions"] = failed_list[-100:]
+                        log(f"  📝 Registered tune fail ({len(failed_list)} total): {base_expr[:60]}")
                     continue
             
             # IS PASS — proceed to SC
