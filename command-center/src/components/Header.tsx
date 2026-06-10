@@ -2,6 +2,13 @@
 
 import { useCallback } from 'react';
 
+interface SystemStats {
+  cpu_percent: number;
+  memory_percent: number;
+  memory_used_gb: number;
+  memory_total_gb: number;
+}
+
 /* ── Types ─────────────────────────────────────────── */
 
 type Status = 'running' | 'paused' | 'done' | 'idle';
@@ -168,9 +175,10 @@ export default function Header({
   startedAt,
   duration,
   batch,
+  system,
   refreshInterval = 3000,
   onRefreshIntervalChange,
-}: HeaderProps) {
+}: HeaderProps & { system?: SystemStats | null }) {
   return (
     <header className="flex w-full items-center justify-between border-b border-zinc-800/80 bg-zinc-900/80 px-3 md:px-6 py-2 md:py-2.5 backdrop-blur-md gap-2">
       {/* Left: Logo */}
@@ -189,6 +197,19 @@ export default function Header({
           {batch && (
             <span className="text-[11px] font-mono text-zinc-500" title="Batch progress">
               📦 Batch {batch}
+            </span>
+          )}
+          {/* System performance indicator */}
+          {system && (
+            <span className="hidden lg:flex items-center gap-2 text-[9px] text-zinc-500 font-mono">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500/50"></span>
+                CPU {system.cpu_percent.toFixed(0)}%
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-purple-500/50"></span>
+                Mem {system.memory_percent.toFixed(0)}% ({system.memory_used_gb}G/{system.memory_total_gb}G)
+              </span>
             </span>
           )}
         </div>

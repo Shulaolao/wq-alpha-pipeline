@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 
 interface Candidate {
   name?: string;
@@ -45,6 +45,21 @@ const EVENT_COLORS: Record<string, string> = {
   generated: '#6366f1',
   optimized: '#a78bfa',
   phase_complete: '#6ee7b7',
+};
+
+// 事件类型分组
+const EVENT_GROUPS: Record<string, string> = {
+  is_pass: 'IS 阶段',
+  is_fail: 'IS 阶段',
+  is_done: 'IS 阶段',
+  is_tune: 'IS 阶段',
+  sc_pass: 'SC 阶段',
+  sc_fail: 'SC 阶段',
+  sc_done: 'SC 阶段',
+  submitted: '提交',
+  generated: '生成',
+  optimized: '优化',
+  phase_complete: '阶段',
 };
 
 function fmt(s: number | null | undefined, decimals = 2): string {
@@ -116,13 +131,40 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
 
   const hasCurrent = currentCandidate && currentCandidate.expr;
 
+  // 获取所有事件类型并去重
+  const eventTypes = useMemo(() => {
+    const types = new Set(flatEvents.map((e: any) => e.event));
+    return ['all', ...Array.from(types)];
+  }, [flatEvents]);
+
+  const [selectedGroup, setSelectedGroup] = useState<string>('all');
+
+  // 筛选事件
+  const filteredEvents = useMemo(() => {
+    if (selectedGroup === 'all') return sorted;
+    return sorted.filter((e: any) => EVENT_GROUPS[e.event] === selectedGroup || e.event === selectedGroup);
+  }, [sorted, selectedGroup]);
+
   const header = (
-    <h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500 mb-3 flex items-center gap-2">
-      Recent Activity
-      <span className="text-[10px] text-gray-600 font-mono font-normal normal-case">
-        {total ?? sorted.length} events
-      </span>
-    </h2>
+    <div className="flex items-center justify-between mb-3">
+      <h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500 flex items-center gap-2">
+        Recent Activity
+        <span className="text-[10px] text-gray-600 font-mono font-normal normal-case">
+          {total ?? sorted.length} events
+        </span>
+      </h2>
+      {/* 事件类型筛选器 */}
+      <select
+        value={selectedGroup}
+        onChange={(e) => setSelectedGroup(e.target.value)}
+        className="bg-dark-800/60 border border-white/[0.06] rounded px-2 py-0.5 text-[9px] text-gray-400 outline-none focus:border-indigo-500/30"
+      >
+        {eventTypes.map((t) => {
+          const label = t === 'all' ? '全部' : EVENT_GROUPS[t] || t.replace(/_/g, ' ');
+          return <option key={t} value={t}>{label}</option>;
+        })}
+      </select>
+    </div>
   );
 
   return (
@@ -154,10 +196,10 @@ export default function Timeline({ events, total, currentCandidate }: TimelinePr
       )}
 
       <div className="space-y-0.5 text-xs max-h-56 overflow-y-auto">
-        {sorted.length === 0 ? (
+        {filteredEvents.length === 0 ? (
           <div className="text-gray-600 text-xs text-center py-6">No activity yet</div>
         ) : (
-          sorted.map((evt: any, i: number) => {
+          filteredEvents.map((evt: any, i: number) => {
             const eventType = evt.event || '';
             const icon = EVENT_ICONS[eventType] || '•';
             const color = EVENT_COLORS[eventType] || '#6b7280';

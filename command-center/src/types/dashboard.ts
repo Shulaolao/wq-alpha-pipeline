@@ -64,6 +64,12 @@ export interface PipelineStatus {
   field_chart: FieldUsage[];
   log: LogEntry[];
   actives: ActiveAlpha[];
+  system?: {
+    cpu_percent: number;
+    memory_percent: number;
+    memory_used_gb: number;
+    memory_total_gb: number;
+  } | null;
 }
 
 export interface HistoryEvent {

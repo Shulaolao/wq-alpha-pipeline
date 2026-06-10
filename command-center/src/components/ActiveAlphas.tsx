@@ -32,6 +32,13 @@ export default function ActiveAlphas({ alphas, total, target }: ActiveAlphasProp
     );
   }
 
+  // 质量统计
+  const avgSharpe = alphas.reduce((s, a) => s + (a.sharpe ?? 0), 0) / alphas.length;
+  const avgFitness = alphas.reduce((s, a) => s + (a.fitness ?? 0), 0) / alphas.length;
+  const highSharpe = alphas.filter(a => (a.sharpe ?? 0) >= 1.5).length;
+  const mediumSharpe = alphas.filter(a => (a.sharpe ?? 0) >= 1.0 && (a.sharpe ?? 0) < 1.5).length;
+  const lowSharpe = alphas.filter(a => (a.sharpe ?? 0) < 1.0).length;
+
   return (
     <div className="card p-4">
       <h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500 mb-3">
@@ -41,6 +48,35 @@ export default function ActiveAlphas({ alphas, total, target }: ActiveAlphasProp
           <span className="ml-1 text-gray-700 font-normal normal-case">/ {target}</span>
         )}
       </h2>
+
+      {/* 质量评分面板 */}
+      <div className="grid grid-cols-3 gap-1.5 mb-3">
+        <div className="bg-zinc-900/60 border border-white/[0.03] rounded-lg p-2">
+          <div className="text-[8px] text-gray-500 uppercase tracking-wider mb-0.5">Avg Sharpe</div>
+          <div className={`text-sm font-bold font-mono tabular-nums ${
+            avgSharpe >= 1.5 ? 'text-emerald-400' : avgSharpe >= 1.0 ? 'text-amber-400' : 'text-rose-400'
+          }`}>
+            {avgSharpe.toFixed(2)}
+          </div>
+        </div>
+        <div className="bg-zinc-900/60 border border-white/[0.03] rounded-lg p-2">
+          <div className="text-[8px] text-gray-500 uppercase tracking-wider mb-0.5">Avg Fitness</div>
+          <div className="text-sm font-bold font-mono tabular-nums text-indigo-400">
+            {avgFitness.toFixed(2)}
+          </div>
+        </div>
+        <div className="bg-zinc-900/60 border border-white/[0.03] rounded-lg p-2">
+          <div className="text-[8px] text-gray-500 uppercase tracking-wider mb-0.5">Quality</div>
+          <div className="text-sm font-bold font-mono tabular-nums">
+            <span className="text-emerald-400">{highSharpe}</span>
+            <span className="text-gray-600">/</span>
+            <span className="text-amber-400">{mediumSharpe}</span>
+            <span className="text-gray-600">/</span>
+            <span className="text-rose-400">{lowSharpe}</span>
+          </div>
+        </div>
+      </div>
+
       <div className="overflow-x-auto" style={{ maxWidth: '100%' }}>
         <table className="w-full text-[11px]" style={{ tableLayout: 'fixed', minWidth: '640px' }}>
           <thead>

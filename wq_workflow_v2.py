@@ -348,12 +348,51 @@ def load_state() -> dict:
         pass
     return state
 
+def _sanitize_state(state: dict) -> dict:
+    """Sanitize non-JSON-serializable keys before saving.
+    
+    Converts tuple/frozenset-keyed dicts (from analyze_orthogonality) to 
+    string keys before json.dumps. Also strips ephemeral objects that 
+    shouldn't persist across restarts.
+    """
+    if "_last_ortho" in state:
+        ortho = state["_last_ortho"]
+        if isinstance(ortho, dict):
+            # ratio_pattern_freq has tuple keys from _extract_ratio_patterns
+            if "ratio_pattern_freq" in ortho:
+                ortho["ratio_pattern_freq"] = {
+                    str(k) if isinstance(k, tuple) else k: v 
+                    for k, v in ortho["ratio_pattern_freq"].items()
+                }
+            # active_quadruples has tuple keys from _extract_field_quadruples
+            if "active_quadruples" in ortho:
+                ortho["active_quadruples"] = {
+                    str(k) if isinstance(k, tuple) else k: v 
+                    for k, v in ortho["active_quadruples"].items()
+                }
+            # field_pairs_used is a set of frozensets — convert to list of sorted tuples
+            if "field_pairs_used" in ortho:
+                fps = ortho["field_pairs_used"]
+                if isinstance(fps, set):
+                    ortho["field_pairs_used"] = [
+                        tuple(sorted(f)) if isinstance(f, frozenset) else f
+                        for f in fps
+                    ]
+            # structures contains dicts with 'fields' as set — convert to list
+            if "structures" in ortho:
+                ortho["structures"] = [
+                    {k: list(v) if isinstance(v, set) else v for k, v in s.items()}
+                    for s in ortho["structures"]
+                ]
+    return state
+
 def save_state(state: dict):
     """Save workflow state to SQLite."""
     state["last_updated"] = datetime.now().isoformat()
     # Truncate errors to last 20 to prevent bloat
     if len(state.get("errors", [])) > 20:
         state["errors"] = state["errors"][-20:]
+    _sanitize_state(state)
     _wqdb.save_workflow_state(STATE_KEY, state)
 
 # ═══ Enhanced log: also write to SQLite ─────────────
@@ -2373,6 +2412,7 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
             return 0.0  # Too similar to existing expressions
 
     # ── P8: Over-generation penalty (forces exploration of new skeletons) ──
+    logged_overgen = set()  # Deduplicate per-skeleton log messages
     for c in deduped:
         base_score = c.get("orthogonality_score", 0)
         # Apply P1: skeleton failure rate penalty
@@ -2404,7 +2444,9 @@ def generate_candidates(ortho: dict, active_exprs: list, n: int = 3,
                 over_attempts = max(0, total_attempts - 10)
                 over_penalty = -(over_attempts // 10) * 2.0
                 base_score += over_penalty
-                log(f"  📊 [{sk}] {total_attempts} total attempts → over-gen penalty: {over_penalty:.1f}")
+                if sk not in logged_overgen:
+                    logged_overgen.add(sk)
+                    log(f"  📊 [{sk}] {total_attempts} total attempts → over-gen penalty: {over_penalty:.1f}")
         # Update the composite score
         c["composite_score"] = round(base_score, 2)
         c["decay_penalty"] = decay
@@ -3258,6 +3300,7 @@ class Workflow:
             # 2. Orthogonality analysis
             ortho = analyze_orthogonality(actives)
             self.state["fields_used"] = ortho["fields_used"]
+            self.state["_last_ortho"] = ortho  # cached for _process_pending_is_pass → _tune_and_retry
             self.state["phase"] = "orthogonality"
             self.save_checkpoint()
             
@@ -3269,7 +3312,7 @@ class Workflow:
             # (before v3.10 fix or due to S=None dead loop consuming all capacity)
             pending_sc = self._process_pending_is_pass()
             if pending_sc:
-                log(f"  🔧 Processed {len(pending_sc)} IS_PASS alpha(s) pending SC")
+                log(f"  🔧 Processed {pending_sc} IS_PASS alpha(s) pending SC")
                 # If we processed pending SC alphas, continue to next outer loop iteration
                 # to re-do orthogonality with any new results
                 if pending_sc > 0:
@@ -3301,29 +3344,35 @@ class Workflow:
                 log(f"\n{'='*50}")
                 log(f"🎯 Processing candidate {idx+1}/{len(candidates)}: {cand['name']}")
 
-                # ── PRE-CHECK: Skip orthogonality-negative candidates ──
+                # ── ORTHOGONALITY PRE-CHECK: Skip if orthogonality is too low ──
+                # With 16/20 ACTIVE alphas, any candidate with negative orthogonality
+                # will almost certainly fail SC or overlap too much.
                 ortho_score = cand.get("orthogonality_score", 0)
-                if ortho_score < 0:
-                    log(f"⏩ {cand['name']}: orthogonality_score={ortho_score:.1f} < 0, skip (field overlap too high)")
-                    self._track_skeleton_outcome(cand, "quick_skip")
-                    # Register as failed to prevent re-selection
+                composite_score = cand.get("composite_score", ortho_score)
+                if ortho_score < 0 or composite_score < -5.0:
+                    log(f"⏩ {cand['name']}: orthogonality_score={ortho_score}, composite={composite_score} — skip (too similar to existing alphas)")
+                    self._track_skeleton_outcome(cand, "quick_skip" if ortho_score < 0 else "quick_fail")
+                    # Register to failed_expressions to prevent re-selection
                     failed_list = self.state.setdefault("failed_expressions", [])
                     expr = cand.get("expr", "")
                     if expr and expr not in failed_list:
                         failed_list.append(expr)
                         if len(failed_list) > 100:
                             self.state["failed_expressions"] = failed_list[-100:]
-                        log(f"  📝 Registered ortho-negative failure ({len(failed_list)} total)")
+                        log(f"  📝 Registered low-ortho failure ({len(failed_list)} total)")
+                    # Record event
                     _wqdb.record_alpha_event(
                         name=cand["name"], expr=cand["expr"],
                         event_type="failed",
-                        phase="generate",
-                        notes=f"Negative orthogonality ({ortho_score:.1f})"
+                        is_status="LOW_ORTHO",
+                        phase="pre_check",
+                        notes=f"orthogonality_score={ortho_score}, composite={composite_score}"
                     )
+                    self.state["batch_idx"] = idx
                     self.state["batch_progress"] = idx + 1
                     self.save_checkpoint()
                     continue
-
+                
                 # ── RECORD: Generated ──
                 _wqdb.record_alpha_event(
                     name=cand["name"], expr=cand["expr"],
@@ -3699,7 +3748,7 @@ class Workflow:
                 if not success:
                     log(f"    ❌ {name}: SC failed ({cand.get('sc_value', '?')})")
                     log(f"    Trying SC tune...")
-                    success = self._tune_and_retry(cand, {}, "sc")
+                    success = self._tune_and_retry(cand, self.state.get("_last_ortho", {}), "sc")
                     if not success:
                         log(f"    ✖️ {name}: all SC variations failed")
                         _wqdb.record_alpha_event(
@@ -3905,7 +3954,8 @@ class Workflow:
                 return False
         
         if r.status_code == 403:
-            # SC already computed - 403 response contains SC check result!
+            # SC already computed — or queued and still PENDING.
+            # 403 response contains SC check result immediately if already done.
             try:
                 body = r.json()
                 checks = body.get("is", {}).get("checks", []) if isinstance(body.get("is"), dict) else []
@@ -3915,33 +3965,45 @@ class Workflow:
                     cand["sc_result"] = sc.get("result")
                     log(f"📊 SC={sc.get('value')} ({sc.get('result')}) ← from 403 response")
                     
-                    # SC pass
+                    # SC was already computed — check result
                     if sc.get("result") == "PASS":
                         log(f"✅ SC PASSED! {cand['name']} SC={sc.get('value')}")
-                        notify(f"SC PASS ✅ {cand['name']}\\nSC={sc.get('value')}", emoji="✅")
+                        notify(f"SC PASS ✅ {cand['name']}\nSC={sc.get('value')}", emoji="✅")
                         return True
                     
-                    # SC fail - extract the reason
-                    limit = sc.get('limit')
-                    value = sc.get('value')
-                    log(f"❌ SC FAIL: SC={value} > limit={limit}")
+                    # SC was queued (PENDING) — need to poll for actual result
+                    if sc.get("result") == "PENDING":
+                        log(f"  📊 SC queued (PENDING) — will poll for result")
+                        def sc_ready(data):
+                            checks_data = data.get("is", {}).get("checks", []) if isinstance(data.get("is"), dict) else []
+                            sc2 = next((c for c in checks_data if c["name"] == "SELF_CORRELATION"), None)
+                            if sc2 and sc2.get("result") != "PENDING":
+                                return sc2
+                            if data.get("status") == "ACTIVE":
+                                return {"result": "PASS", "value": 0}
+                            return None
+                        
+                        sc_result, self.s = adaptive_poll(
+                            self.s, f"{API}/alphas/{alpha_id}",
+                            f"SC {cand['name']}",
+                            sc_ready, max_wait=7200,
+                            initial_interval=30, fallback_interval=120,
+                            stuck_threshold=300
+                        )
+                        
+                        if sc_result is not None and sc_result.get("result") == "PASS":
+                            cand["sc_value"] = sc_result.get("value")
+                            cand["sc_result"] = "PASS"
+                            log(f"✅ SC PASSED (after polling)! {cand['name']} SC={sc_result.get('value')}")
+                            notify(f"SC PASS ✅ {cand['name']}\nSC={sc_result.get('value')}", emoji="✅")
+                            return True
+                        else:
+                            log(f"❌ SC FAIL after polling: {cand['name']}")
+                            return self._handle_sc_failure(cand, sc_result, alpha_id)
                     
-                    # Store SC value for feedback loop
-                    _wqdb.record_alpha_event(
-                        name=cand.get("name", ""), expr=cand.get("expr", ""),
-                        event_type="sc_fail",
-                        alpha_id=alpha_id,
-                        sc_value=value,
-                        sc_result="FAIL",
-                        phase="sc_submit"
-                    )
-                    self._track_skeleton_outcome(cand, "sc_fail", sc_value=value)
-                    
-                    # If SC value is very high (>0.9), add hint to expression modifier
-                    if value and value > 0.9:
-                        log(f"⚠️ SC value too high ({value} > 0.9) - will add ts_* operators", "warn")
-                    
-                    return False
+                    # SC fail — definite FAILURE (not PENDING)
+                    # This is a proper SC failure with value/limit
+                    return self._handle_sc_failure(cand, sc, alpha_id)
                 else:
                     # 403 response but no SELF_CORRELATION check found
                     # This is a PERMANENT failure — the alpha can never pass SC.
@@ -3983,7 +4045,30 @@ class Workflow:
         else:
             log(f"❌ SC submit: HTTP {r.status_code} {r.text[:100]}", "error")
             return False
-
+    
+    def _handle_sc_failure(self, cand: dict, sc: dict, alpha_id: str) -> bool:
+        """Handle SC failure: log, track, notify. Extracted to avoid code duplication."""
+        limit = sc.get('limit') if sc else None
+        value = sc.get('value') if sc else None
+        log(f"❌ SC FAIL: SC={value} > limit={limit}")
+        
+        # Store SC value for feedback loop
+        _wqdb.record_alpha_event(
+            name=cand.get("name", ""), expr=cand.get("expr", ""),
+            event_type="sc_fail",
+            alpha_id=alpha_id,
+            sc_value=value,
+            sc_result="FAIL",
+            phase="sc_submit"
+        )
+        self._track_skeleton_outcome(cand, "sc_fail", sc_value=value)
+        
+        # If SC value is very high (>0.9), add hint to expression modifier
+        if value and value > 0.9:
+            log(f"⚠️ SC value too high ({value} > 0.9) - will add ts_* operators", "warn")
+        
+        return False
+    
     def probe_wq_queue_health(self, max_tries: int = 3) -> dict:
         """
         Pre-SC-submission health probe: checks WQ SC queue congestion state.
@@ -4586,8 +4671,10 @@ class Workflow:
             # Phase 2: AST residual pruning — topological mutations to break self-correlation
             # These mutations produce different skeletons (NONLINEAR_BREAKER, DEEP_CASCADE, TSRANK_CORR, etc.)
             if base_expr and not skip_to_new_skeleton:
+                # Fetch active expressions once for all mutation phases
+                active_exprs_phase2 = self._get_active_expressions()
                 builder = DynamicSkeletonBuilder()
-                ast_mutations = builder.mutate_expr_topology(base_expr, ortho, active_exprs, max_variants=8)
+                ast_mutations = builder.mutate_expr_topology(base_expr, ortho, active_exprs_phase2, max_variants=8)
                 if ast_mutations:
                     log(f"  🔧 Phase 2: AST residual pruning — {len(ast_mutations)} mutations generated")
                     for mut in ast_mutations:
@@ -4656,7 +4743,7 @@ class Workflow:
                         log(f"    Cross-skeleton {cc['cross_skeleton']} failed")
             
             # Phase 4: Last resort — field pair swap on MULT_RATIO (only if not already exhausted)
-            if not skip_to_new_skeleton:
+            if not skip_to_new_skeleton and isinstance(ortho, dict) and "fields_used" in ortho:
                 log(f"  ⚠️ Phase 4: All cross-skeleton attempts exhausted — falling back to field pair swap")
                 field_usage = ortho["fields_used"]
                 used_pairs = ortho.get("field_pairs_used", set())

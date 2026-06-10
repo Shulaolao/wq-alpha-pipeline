@@ -13,6 +13,12 @@ interface PipelineStatsProps {
   duration?: string;
 }
 
+// 辅助函数：计算转化率
+function calcRate(numerator: number, denominator: number, decimals = 1): string {
+  if (denominator === 0) return '0.0%';
+  return ((numerator / denominator) * 100).toFixed(decimals) + '%';
+}
+
 const passCards = [
   { key: 'generated', label: 'Generated', color: 'text-white', bg: 'bg-zinc-500', icon: '✦' },
   { key: 'isPassed', label: 'IS Passed', color: 'text-emerald-400', bg: 'bg-emerald-500', icon: '◉' },
@@ -81,15 +87,77 @@ export default function PipelineStats(props: PipelineStatsProps) {
         ))}
       </div>
 
+      {/* 转化率指标组 - 新增 */}
       {total > 0 && (
-        <div className="mt-1.5">
-          <div className="flex items-center justify-between text-[8px] text-zinc-600 mb-0.5">
-            <span>转化</span>
-            <span className="text-zinc-500 font-mono">{props.submitted}/{total} · {((props.submitted / total) * 100).toFixed(1)}%</span>
+        <div className="mt-1.5 space-y-1.5">
+          {/* IS转化率 */}
+          <div>
+            <div className="flex items-center justify-between text-[8px] text-zinc-600 mb-0.5">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500/50"></span>
+                IS通过率
+              </span>
+              <span className="text-zinc-500 font-mono">
+                {calcRate(props.isPassed, total)} ({props.isPassed}/{total})
+              </span>
+            </div>
+            <div className="h-0.5 bg-zinc-800/70 rounded-full overflow-hidden">
+              <div 
+                className="h-full bg-gradient-to-r from-emerald-600 to-emerald-500 rounded-full transition-all duration-1000"
+                style={{ width: `${(props.isPassed / total) * 100}%` }} 
+              />
+            </div>
           </div>
-          <div className="h-0.5 bg-zinc-800/70 rounded-full overflow-hidden">
-            <div className="h-full bg-gradient-to-r from-indigo-600 to-emerald-500 rounded-full transition-all duration-1000"
-              style={{ width: `${(props.submitted / total) * 100}%` }} />
+
+          {/* SC转化率 */}
+          <div>
+            <div className="flex items-center justify-between text-[8px] text-zinc-600 mb-0.5">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500/50"></span>
+                SC通过率
+              </span>
+              <span className="text-zinc-500 font-mono">
+                {calcRate(props.scPassed, props.isPassed)} ({props.scPassed}/{props.isPassed})
+              </span>
+            </div>
+            <div className="h-0.5 bg-zinc-800/70 rounded-full overflow-hidden">
+              <div 
+                className="h-full bg-gradient-to-r from-indigo-600 to-indigo-500 rounded-full transition-all duration-1000"
+                style={{ width: `${props.isPassed > 0 ? (props.scPassed / props.isPassed) * 100 : 0}%` }} 
+              />
+            </div>
+          </div>
+
+          {/* 总提交率 */}
+          <div>
+            <div className="flex items-center justify-between text-[8px] text-zinc-600 mb-0.5">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500/50"></span>
+                总提交率
+              </span>
+              <span className="text-zinc-500 font-mono">
+                {calcRate(props.submitted, total)} ({props.submitted}/{total})
+              </span>
+            </div>
+            <div className="h-0.5 bg-zinc-800/70 rounded-full overflow-hidden">
+              <div 
+                className="h-full bg-gradient-to-r from-amber-600 to-amber-500 rounded-full transition-all duration-1000"
+                style={{ width: `${(props.submitted / total) * 100}%` }} 
+              />
+            </div>
+          </div>
+
+          {/* 失败率汇总 */}
+          <div className="pt-1.5 border-t border-white/[0.03]">
+            <div className="flex items-center justify-between text-[8px] text-zinc-600 mb-0.5">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-500/50"></span>
+                失败率汇总
+              </span>
+              <span className="text-rose-400/80 font-mono">
+                IS:{calcRate(props.isFail, total)} | SC:{calcRate(props.scFail, props.isPassed)}
+              </span>
+            </div>
           </div>
         </div>
       )}

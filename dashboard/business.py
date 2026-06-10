@@ -313,4 +313,17 @@ def build_poll_data(status_data: Dict[str, Any]) -> Dict[str, Any]:
     status_data["orthogonality"] = o if o.get("nodes") else {
         "nodes": [], "edges": [], "node_count": 0, "edge_count": 0
     }
+    
+    # System Performance
+    try:
+        import psutil
+        status_data["system"] = {
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
+            "memory_percent": psutil.virtual_memory().percent,
+            "memory_used_gb": round(psutil.virtual_memory().used / (1024**3), 2),
+            "memory_total_gb": round(psutil.virtual_memory().total / (1024**3), 1),
+        }
+    except ImportError:
+        status_data["system"] = None
+    
     return status_data

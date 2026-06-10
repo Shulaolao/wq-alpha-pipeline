@@ -18,11 +18,23 @@ DB_PATH = Path.home() / ".wq_workflow_v2.db"
 
 
 def get_db() -> sqlite3.Connection:
-    """Get database connection with WAL mode and proper settings."""
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    db_path = str(DB_PATH)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
+    return conn
+
+def execute_query(sql: str, params: tuple = ()) -> list:
+    """Execute a SQL query and return all rows as list of tuples."""
+    conn = get_db()
+    try:
+        cursor = conn.execute(sql, params)
+        rows = cursor.fetchall()
+        # Convert sqlite3.Row to tuples for consistency
+        return [tuple(r) for r in rows]
+    finally:
+        conn.close()
     return conn
 
 
@@ -183,16 +195,10 @@ def save_workflow_state(key: str, value: dict):
 
 def load_workflow_state(key: str) -> dict:
     """Load a workflow state value by key."""
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT value FROM workflow_state WHERE key = ?", (key,)
-        ).fetchone()
-        if row:
-            return json.loads(row["value"])
-        return {}
-    finally:
-        conn.close()
+    result = execute_query("SELECT value FROM workflow_state WHERE key = ?", (key,))
+    if result and result[0]:
+        return json.loads(result[0][0])
+    return {}
 
 
 # ─── Alpha Event Recording ─────────────────────────────────────────

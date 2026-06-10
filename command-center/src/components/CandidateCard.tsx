@@ -30,9 +30,60 @@ export default function CandidateCard({ candidate, batchIndex, batchTotal }: Can
         )}
       </div>
 
+      {/* 表达式 */}
       <pre className="font-mono text-sm bg-dark-900/80 rounded-lg p-3 border border-white/[0.04] leading-relaxed overflow-x-auto whitespace-pre-wrap text-zinc-200">
         {candidate.expr || '—'}
       </pre>
+
+      {/* 字段分布可视化 */}
+      {candidate.fields && candidate.fields.length > 0 && (
+        <div className="mt-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[9px] text-gray-500 uppercase tracking-wider">Fields</span>
+            <span className="text-[9px] text-gray-600 font-mono">{candidate.fields.length}</span>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {candidate.fields.slice(0, 12).map((field, i) => (
+              <span
+                key={field}
+                className="px-1.5 py-0.5 rounded text-[8px] font-mono bg-gray-800/40 border border-white/[0.03] text-gray-400"
+                title={field}
+              >
+                {field}
+              </span>
+            ))}
+            {candidate.fields.length > 12 && (
+              <span className="px-1.5 py-0.5 rounded text-[8px] text-gray-500">
+                +{candidate.fields.length - 12}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 正交性得分 */}
+      {candidate.orthogonality_score !== undefined && (
+        <div className="mt-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[9px] text-gray-500 uppercase tracking-wider">Orthogonality</span>
+            <span className={`text-[10px] font-bold font-mono ${
+              candidate.orthogonality_score >= 0.8 ? 'text-emerald-400' :
+              candidate.orthogonality_score >= 0.5 ? 'text-amber-400' : 'text-rose-400'
+            }`}>
+              {(candidate.orthogonality_score * 100).toFixed(1)}%
+            </span>
+          </div>
+          <div className="h-1 bg-gray-800/70 rounded-full overflow-hidden mt-1">
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${
+                candidate.orthogonality_score >= 0.8 ? 'bg-gradient-to-r from-emerald-600 to-emerald-400' :
+                candidate.orthogonality_score >= 0.5 ? 'bg-gradient-to-r from-amber-600 to-amber-400' : 'bg-gradient-to-r from-rose-600 to-rose-400'
+              }`}
+              style={{ width: `${candidate.orthogonality_score * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-3 gap-3 mt-3">
         {/* IS Status */}
